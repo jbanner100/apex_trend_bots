@@ -1,0 +1,22 @@
+# Web + server
+flask==3.0.3
+gunicorn==21.2.0
+requests==2.32.3
+
+# Trading & data
+ccxt==4.3.87
+pandas==2.2.2
+numpy==1.26.4
+
+# Crypto / Ethereum stack (signing, keys)
+web3==6.19.0
+eth-account==0.10.0
+eth-abi==5.1.0
+hexbytes==0.3.1
+coincurve==19.0.1
+pycryptodome==3.20.0
+
+# General utils
+python-dotenv==1.0.1
+tenacity==9.0.0
+ujson==5.10.0
