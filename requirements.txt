@@ -1,29 +1,23 @@
 # Web + server
-pip>=24.2
-setuptools>=70
-wheel>=0.43.0
-toml==0.10.2
-tomli==2.0.1
-
-flask==3.0.3
+Flask==3.0.3
 gunicorn==21.2.0
 requests==2.32.3
 
-# Trading & data
+# Trading & data (wheel-friendly on Linux x86_64)
+pandas==2.0.3
+numpy==1.24.3
 ccxt==4.3.87
-pandas==2.2.2
-numpy==1.26.4
 
-# Crypto / Ethereum stack (signing, keys)
+# Crypto / Ethereum stack
 web3==6.19.0
 eth-account==0.10.0
 eth-abi==5.1.0
 hexbytes==0.3.1
 coincurve==19.0.1
 pycryptodome==3.20.0
+ecdsa==0.18.0
 
-# General utils
-python-dotenv==1.0.1
-tenacity==9.0.0
+# Utils
 ujson==5.10.0
-apexomni
+tenacity==9.0.0
+python-dotenv==1.0.1
