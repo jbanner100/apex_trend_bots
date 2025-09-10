@@ -1,4 +1,10 @@
 # Web + server
+pip>=24.2
+setuptools>=70
+wheel>=0.43.0
+toml==0.10.2
+tomli==2.0.1
+
 flask==3.0.3
 gunicorn==21.2.0
 requests==2.32.3
