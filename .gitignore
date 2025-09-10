@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+ENV/
+.DS_Store
+
+# Local data
+/data/
+capalloc.db
+*.sqlite
+*.db
