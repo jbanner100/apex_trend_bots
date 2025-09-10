@@ -1,14 +1,12 @@
-# capital_manager.py — v1.4c (engine; no envs)
+# capital_manager.py — v1.4e (engine; no envs)
 # Purpose:
 #   • Maintain a wallet snapshot (USDT contract) in SQLite
 #   • Manage per-bot weights and normalized allocations
 #   • Atomic reserve/release per bot with WAL + BEGIN IMMEDIATE
 #
 # Notes:
-#   • Credentials are hardcoded by design here (“no envs”). For safety, rotate
-#     any keys you pasted previously and move to env vars later if possible.
-#   • File is self-contained; importing apexomni is “soft” so the module
-#     can load even if the SDK isn’t installed yet (client=None).
+#   • Credentials are hardcoded by request. Rotate them before going live.
+#   • Soft-import apexomni so this module can load even if the SDK isn’t ready.
 #   • Python 3.12 recommended on Render. requirements.txt should pin:
 #       apexomni==3.0.8, ecdsa==0.19.0, pandas==2.2.3, ccxt==4.3.79, web3<7
 
@@ -16,21 +14,22 @@ import time
 import sqlite3
 import threading
 from decimal import Decimal, getcontext
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
-# ================== CREDENTIALS — FILL THESE IN ==================
-# If you insist on “no envs”, hardcode here (recommended: rotate keys first).
-key = api_key or os.environ.get("APEX_API_KEY") or "3e965beb-41e2-f125-a7c5-569f45bfba21"
-        secret = api_secret or os.environ.get("APEX_API_SECRET") or "NXtuAyq4hS9G4fVlytQtQGn9Qk5LUukXGAYg8SBj"
-        passphrase = api_passphrase or os.environ.get("APEX_API_PASSPHRASE") or "GEy6yNGaZ5_0fuX4VBJ3"
-        seeds = zk_seeds or os.environ.get("ZK_SEEDS") or "0xd00ec9396facbafc423b5d92a289ea49adfdb0b918d3d5db26edbb978893ed5d0bd48c3fbe4309de2a09a3514cbec6d2c4012df85653a1421aca1cf599acda491c"
-        l2key = zk_l2key or os.environ.get("ZK_L2KEY") or "0xd6094a658c50dccf9be8f85cde1804e92a74a0482788766c9b8744cbc6fe8501"
+# ================== CREDENTIALS — (TEMPORARY; WILL ROTATE) ==================
+api_creds = {
+    "key":        "3e965beb-41e2-f125-a7c5-569f45bfba21",
+    "secret":     "NXtuAyq4hS9G4fVlytQtQGn9Qk5LUukXGAYg8SBj",
+    "passphrase": "GEy6yNGaZ5_0fuX4VBJ3",
+}
+zk_seeds = "0xd00ec9396facbafc423b5d92a289ea49adfdb0b918d3d5db26edbb978893ed5d0bd48c3fbe4309de2a09a3514cbec6d2c4012df85653a1421aca1cf599acda491c"
+zk_l2Key = "0xd6094a658c50dccf9be8f85cde1804e92a74a0482788766c9b8744cbc6fe8501"
 
 # Uppercase aliases so either naming style works elsewhere.
 API_CREDS = api_creds
 ZK_SEEDS  = zk_seeds
 ZK_L2KEY  = zk_l2Key
-# ================================================================
+# ============================================================================
 
 # ====== DB LOCATION (no envs) ======
 DB_PATH_DEFAULT = "./capalloc.db"
@@ -100,7 +99,7 @@ class CapitalManager:
             client = HttpPrivateSign(
                 APEX_OMNI_HTTP_MAIN,
                 network_id=NETWORKID_OMNI_MAIN_ARB,
-                api_key_credentials=api_creds,  # use lowercase names actually defined
+                api_key_credentials=api_creds,  # using lowercase identifiers defined above
                 zk_seeds=zk_seeds,
                 zk_l2Key=zk_l2Key,
             )
@@ -216,8 +215,10 @@ class CapitalManager:
 
                 conn.commit()
             except Exception:
-                try: conn.rollback()
-                except Exception: pass
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 return False
             finally:
                 conn.close()
@@ -251,8 +252,10 @@ class CapitalManager:
                 conn.commit()
                 return True
             except Exception:
-                try: conn.rollback()
-                except Exception: pass
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 return False
             finally:
                 conn.close()
@@ -310,8 +313,10 @@ class CapitalManager:
                     "available_usdt": str(available),
                 }
             except Exception as e:
-                try: conn.rollback()
-                except Exception: pass
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 return {"ok": False, "error": str(e)}
             finally:
                 conn.close()
@@ -343,8 +348,10 @@ class CapitalManager:
                 conn.commit()
                 return {"ok": True, "reserved_usdt": str(new_res)}
             except Exception as e:
-                try: conn.rollback()
-                except Exception: pass
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 return {"ok": False, "error": str(e)}
             finally:
                 conn.close()
@@ -397,26 +404,5 @@ class CapitalManager:
             }
         finally:
             conn.close()
-
-
-# ---------- Self-test (optional; safe to keep during bring-up) ----------
-if __name__ == "__main__":
-    cm = CapitalManager()
-    print("OK: CapitalManager constructed")
-    print("Initial health:", cm.health())
-
-    # Example: configure two bots 50/50
-    ok = cm.configure_bots({"BTC": "0.5", "SOL": "0.5"})
-    print("configure_bots:", ok, cm.health())
-
-    # Reserve 5% for BTC
-    print("reserve BTC 5%:", cm.reserve("BTC", "0.05"))
-
-    # Release 1.0 USDT from BTC
-    print("release BTC 1.0:", cm.release("BTC", "1.0"))
-
-    # Simulate close -> refresh wallet snapshot + zero reservation + re-alloc
-    print("on_close BTC:", cm.on_close("BTC"))
-    print("final health:", cm.health())
 
 
