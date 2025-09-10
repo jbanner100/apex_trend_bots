@@ -3,10 +3,11 @@ Flask==3.0.3
 gunicorn==21.2.0
 requests==2.32.3
 
-# Trading & data (wheel-friendly on Linux x86_64)
-pandas==2.0.3
-numpy==1.24.3
+# Trading & data
 ccxt==4.3.87
+# Use wheels that support Python 3.13 to avoid building from source
+numpy>=2.1.1,<3.0
+pandas>=2.2.3,<3.0
 
 # Crypto / Ethereum stack
 web3==6.19.0
@@ -15,9 +16,7 @@ eth-abi==5.1.0
 hexbytes==0.3.1
 coincurve==19.0.1
 pycryptodome==3.20.0
-ecdsa==0.18.0
 
 # Utils
-ujson==5.10.0
 tenacity==9.0.0
-python-dotenv==1.0.1
+ujson==5.10.0
