@@ -1,5 +1,4 @@
- bots/app_sol_v1_4.py — Apex Omni SOL Bot (v1.4)
-# Render-ready + reliable dash logging + instant exit on TREND flip
+
 
 import os
 import sys
