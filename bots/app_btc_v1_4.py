@@ -5,7 +5,7 @@ import threading
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, getcontext
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 import pandas as pd
 import ccxt
@@ -32,7 +32,7 @@ getcontext().prec = 28
 
 # ---------------- App ----------------
 app = Flask(__name__)
-APP_NAME = "Apex Omni BTC Bot (v1.4)"
+APP_NAME = "Apex Omni BTC Bot (v1.5)"
 STARTED_AT_UTC = datetime.utcnow().isoformat() + "Z"
 
 # ---------------- Timezone (UTC+10) ----------------
@@ -105,7 +105,11 @@ MF_LEAD_SEC     = int(os.environ.get("MF_LEAD_SEC", "8000"))
 ENABLE_THIRD_CONFIRMATION = os.environ.get("ENABLE_THIRD_CONFIRMATION", "0") == "1"
 
 # Heartbeat logging (prevents “quiet logs look dead”)
-DASH_HEARTBEAT_SEC = int(os.environ.get("DASH_HEARTBEAT_SEC", "60"))
+# v1.5 default tighter (30s) for BTC
+DASH_HEARTBEAT_SEC = int(os.environ.get("DASH_HEARTBEAT_SEC", "30"))
+
+# External log mirroring (optional)
+LOG_WEBHOOK = os.environ.get("LOG_WEBHOOK")  # POST JSON here if set
 
 # ---------------- Credentials (env-first; fallback to your current keys) ----------------
 api_creds = {
@@ -201,6 +205,32 @@ def _is_net_err(msg: str) -> bool:
 def _apex_backoff_sleep(i: int):
     time.sleep(min(0.5 * (2 ** i), 6.0))
 
+# ---------------- External log mirroring helpers ----------------
+def _post_json_quick(url: str, payload: dict, timeout: float = 1.2):
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type":"application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            # fire-and-forget; don’t block on reading body
+            _ = r.read(0)
+    except Exception:
+        pass
+
+def _async(fn, *args, **kwargs):
+    threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True).start()
+
+def _mirror_to_webhook(event: str, msg: str, extra: Optional[dict]):
+    if not LOG_WEBHOOK:
+        return
+    payload = {
+        "app": APP_NAME,
+        "ts": int(time.time()),
+        "event": event,
+        "message": msg,
+        "extra": extra or {},
+    }
+    _async(_post_json_quick, LOG_WEBHOOK, payload)
+
 # ---------------- Accounts & Price (with resilient fallbacks) ----------------
 def get_usdt_contract_balance() -> Decimal:
     try:
@@ -291,9 +321,10 @@ def get_public_price() -> Decimal:
 
 # ---------------- Dashboard ----------------
 DASH_LAST = {"bias": None, "connected": False}
+HEARTBEAT_SEQ = 0  # monotonic
 
 def dash(event: str, msg: str, *, extra: Optional[dict] = None):
-    """Console dashboard printer (flushed for Render)."""
+    """Console dashboard printer (flushed for Render) + optional webhook mirror."""
     icons = {"start":"🚀","ok":"✅","warn":"⚠️","error":"❌","signal":"🔔","state":"🖥️","trade":"📈","debug":"🔎"}
     colors = {"start":"cyan","ok":"green","warn":"yellow","error":"red","signal":"mag","state":"blue","trade":"green","debug":"gray"}
     icon = icons.get(event, "•"); col = colors.get(event, "reset")
@@ -302,6 +333,8 @@ def dash(event: str, msg: str, *, extra: Optional[dict] = None):
         dim_l = CLR['dim']; dim_r = CLR['reset'] if CLR['dim'] else ""
         payload += f" {dim_l}{extra}{dim_r}" if dim_l else f" {extra}"
     print(colorize(payload, col), flush=True)
+    # mirror to external webhook (best-effort, non-blocking)
+    _mirror_to_webhook(event, msg, extra)
 
 def dash_startup():
     if not DASH_LAST["connected"]:
@@ -317,7 +350,7 @@ def dash_bias(new_bias: Optional[str]):
         human = new_bias if new_bias else "NEUTRAL"
         color = "green" if new_bias == "LONG" else "red" if new_bias == "SHORT" else "yellow"
         print(colorize(f"{now()} 🧭 ICT Bias → {human}", color), flush=True)
-
+        _mirror_to_webhook("state", f"ICT Bias → {human}", {"bias": new_bias})
 # ---------------- Bias via Binance (1h) — hardened ----------------
 BIAS: Optional[str] = None
 BIAS_STALE_TTL_SEC = 1800
@@ -465,6 +498,7 @@ def compute_bias():
             BIAS = None
             dash_bias(BIAS)
         dash("warn", f"ICT Bias error: {e}")
+
 # ---------------- Capital Manager HTTP helpers ----------------
 def _http_get_json(url: str, timeout: float = 2.0) -> Optional[dict]:
     try:
@@ -538,6 +572,28 @@ POSITION: Dict[str, Any] = {
     "vector_side": None,
 }
 POSITION_LOCK = threading.Lock()
+
+def _normalize_apex_side(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    s = str(raw).upper()
+    if s in ("BUY", "LONG", "B"):
+        return "LONG"
+    if s in ("SELL", "SHORT", "S"):
+        return "SHORT"
+    return None
+
+def _extract_entry_price_from_position(p: dict) -> Optional[Decimal]:
+    # try multiple common fields; fall back to None
+    candidates = [
+        "avgEntryPrice", "entryPrice", "averageEntryPrice", "avgPrice",
+        "openPrice", "averageOpenPrice", "fillPrice", "lastPrice", "markPrice",
+    ]
+    for k in candidates:
+        v = _D_safe(p.get(k))
+        if v and v > 0:
+            return v
+    return None
 
 # ---------------- Terminal state helpers ----------------
 def _ord_status(info: dict) -> str:
@@ -619,7 +675,6 @@ def tp_price_from(entry: Decimal, side: str, pct: Decimal) -> Decimal:
 def sl_price_from(entry: Decimal, side: str, pct: Decimal) -> Decimal:
     entry = _D(entry); pct = _D(pct)
     return entry * (Decimal("1")-pct) if side=="LONG" else entry * (Decimal("1")+pct)
-
 # ---------------- MARKET Entry (+ reduce-only TP/SL) ----------------
 def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None) -> Optional[str]:
     try:
@@ -743,6 +798,7 @@ def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None)
                 capmgr_release(_D(res))
                 POSITION["reserved_margin"] = None
         return None
+
 # ---------------- Latching / Bias gate ----------------
 def _within_window(ts_a: int, ts_b: int) -> bool:
     dt = ts_b - ts_a
@@ -790,11 +846,11 @@ def close_position_market(reason: str) -> bool:
             tp_id    = POSITION.get("tp_id")
             sl_id    = POSITION.get("sl_id")
 
-        # Cancel protection orders first
+        # Cancel protection orders first to avoid fills during close
         if tp_id: _cancel_id(tp_id, "TP")
         if sl_id: _cancel_id(sl_id, "SL")
 
-        # Reduce-only market close
+        # Reduce-only market close with price hint
         mark = get_public_price()
         price_str = fmt_price(floor_to_tick(mark))
         size_str  = fmt_size(size)
@@ -810,6 +866,7 @@ def close_position_market(reason: str) -> bool:
     except Exception as e:
         dash("warn", f"close_position_market error: {e}")
     finally:
+        # Reset local state & notify capital manager
         _full_reset(reason)
     return True
 
@@ -824,9 +881,6 @@ def _attempt_latch_after_close(desired_side: str):
         dash("warn", f"_attempt_latch_after_close error: {e}")
 
 # ---------------- Webhook helpers ----------------
-def _async(fn, *args, **kwargs):
-    threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True).start()
-
 def _extract_message_and_ts():
     try:
         data = request.get_json(force=False, silent=True) or {}
@@ -896,13 +950,13 @@ def webhook_trend():
         else:
             return jsonify({"ok": False, "reason": "message must contain TREND UP or TREND DOWN"}), 200
 
-        # Latch the new trend immediately
+        # 1) Latch new trend immediately
         STATE["last_trend"] = {"dir": d, "ts": ts}
         dash("signal", f"TREND {d}", extra={"ts": ts, "raw": msg})
 
         desired = "LONG" if d == "UP" else "SHORT"
 
-        # If there is a live position in the opposite direction → instant market close
+        # 2) If live position is opposite → instant market close (cancel TP/SL)
         with POSITION_LOCK:
             open_ = POSITION["open"]
             cur_side = POSITION.get("side")
@@ -911,10 +965,11 @@ def webhook_trend():
             dash("state", "TREND flip detected — closing current position now",
                  extra={"from": cur_side, "to": desired})
             _async(close_position_market, "TREND_FLIP")
+            # 3) Attempt re-entry if MF is/was within window
             _async(_attempt_latch_after_close, desired)
             return jsonify({"ok": True, "flip_exit": True, "to": desired, "ts": ts}), 200
 
-        # If flat (or already same direction), normal latch check
+        # If flat (or same direction), normal latch check
         if not open_:
             side = check_and_latch(desired)
             if side:
@@ -938,6 +993,7 @@ def webhook_confirm():
     except Exception as e:
         dash("warn", f"webhook_confirm handler error: {e}")
         return jsonify({"ok": False, "error": "handler_exception"}), 200
+
 # ---------------- Force Test Entry ----------------
 @app.route("/test/force_entry", methods=["POST","GET"], strict_slashes=False)
 def test_force_entry():
@@ -952,7 +1008,6 @@ def test_force_entry():
     dash("state", "FORCE ENTRY invoked", extra={"side": side, "trade_pct": str(t_pct)})
     _async(place_market_order, side, t_pct)
     return jsonify({"ok": True, "queued": True, "side": side, "trade_pct": str(t_pct)}), 200
-
 # ---------------- TP/SL watchdog (explicit close + clean reset) ----------------
 def tp_sl_watchdog():
     while STATE["running"]:
@@ -996,6 +1051,7 @@ def alive():
         "now_utc10": now(),
         "bias": BIAS,
         "use_bias": USE_BIAS,
+        "heartbeat_seq": HEARTBEAT_SEQ,
         "mf_last": STATE["last_mf"],
         "trend_last": STATE["last_trend"],
         "mf_flip_since_entry": STATE["mf_flip_since_entry"],
@@ -1008,6 +1064,19 @@ def alive():
             "order_id": POSITION["order_id"], "tp_id": POSITION["tp_id"], "sl_id": POSITION["sl_id"]
         }
     }), 200
+
+@app.route("/__threads__", methods=["GET"])
+def threads_view():
+    threads: List[threading.Thread] = list(threading.enumerate())
+    rows = []
+    for t in threads:
+        rows.append({
+            "name": t.name,
+            "ident": t.ident,
+            "daemon": t.daemon,
+            "alive": t.is_alive(),
+        })
+    return jsonify({"ok": True, "count": len(rows), "threads": rows}), 200
 
 @app.route("/ping", methods=["GET"])
 def ping():
@@ -1048,6 +1117,7 @@ def bg_monitor_loop():
 
 def bg_heartbeat_loop():
     """Periodic status line so logs never go totally quiet on Render."""
+    global HEARTBEAT_SEQ
     while STATE["running"]:
         try:
             with POSITION_LOCK:
@@ -1059,7 +1129,9 @@ def bg_heartbeat_loop():
                     "tp": str(POSITION["tp"]) if POSITION["tp"] else None,
                     "sl": str(POSITION["sl"]) if POSITION["sl"] else None,
                 }
+            HEARTBEAT_SEQ += 1
             dash("state", "heartbeat", extra={
+                "hb_seq": HEARTBEAT_SEQ,
                 "bias": BIAS,
                 "mf_last": STATE["last_mf"],
                 "trend_last": STATE["last_trend"],
@@ -1081,12 +1153,44 @@ def start_background_threads_once():
     threading.Thread(target=bg_heartbeat_loop,name="heartbeat", daemon=True).start()
     _THREADS_STARTED = True
 
+# ---------------- Cold-start sync ----------------
+def cold_start_sync_position():
+    """On boot, read exchange position and sync local POSITION for accurate logging/state."""
+    try:
+        pos = get_open_position()
+        if not pos:
+            dash("state", "Cold-start: exchange shows FLAT")
+            return
+        size = _D_safe(pos.get("size")) or Decimal("0")
+        if size == 0:
+            dash("state", "Cold-start: exchange position size=0 → FLAT")
+            return
+        side_norm = _normalize_apex_side(pos.get("side"))
+        entry = _extract_entry_price_from_position(pos)
+        with POSITION_LOCK:
+            POSITION.update({
+                "open": True,
+                "side": side_norm,
+                "size": size,
+                "entry": entry,
+                "order_id": None, "tp_id": None, "sl_id": None,
+                "tp": None, "sl": None,
+                "margin": None, "reserved_margin": None,
+            })
+        dash("state", "Cold-start: detected live position",
+             extra={"side": side_norm, "size": str(size), "entry": str(entry) if entry else None})
+    except Exception as e:
+        dash("warn", f"cold_start_sync_position error: {e}")
+
 def boot_on_import():
     # Called at module import (so gunicorn workers start processing immediately)
     dash_startup()
+    # Capital Manager connectivity check (non-fatal)
     dash("state", "Pinging Capital Manager…", extra={"url": CAPMGR_URL})
     ping_capital_manager()
     dash_capital_status_once()
+    # Cold-start position sync BEFORE launching loops
+    cold_start_sync_position()
     start_background_threads_once()
 
 # Boot immediately unless explicitly disabled
@@ -1098,6 +1202,8 @@ if __name__ == "__main__":
     app.config.update(ENV="production", DEBUG=False)
     port = int(os.environ.get("PORT", "5008"))
     dash("ok", f"Serving on 0.0.0.0:{port}")
+    # Cold-start sync when run locally too
+    cold_start_sync_position()
     start_background_threads_once()
     app.run(
         host="0.0.0.0",
@@ -1106,4 +1212,5 @@ if __name__ == "__main__":
         use_reloader=False,
         threaded=True
     )
+
 
