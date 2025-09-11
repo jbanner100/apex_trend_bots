@@ -1,6 +1,7 @@
-# app_btc_v1_4.py — Apex Omni BTC Bot (v1.4) — Render-ready
+# app_btc_v1_4.py — Apex Omni BTC Bot (v1.4) — Render-ready + reliable dash logging
 
 import os
+import sys
 import json
 import threading
 import time
@@ -21,6 +22,14 @@ from apexomni.constants import APEX_OMNI_HTTP_MAIN, NETWORKID_OMNI_MAIN_ARB
 from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.http_public import HttpPublic
 
+# --------- make stdout/stderr line-buffered so Render logs don't “freeze” ----------
+# (PYTHONUNBUFFERED=1 is also recommended in Render env vars)
+try:
+    sys.stdout.reconfigure(line_buffering=True)  # py>=3.7
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 # ---------------- Precision ----------------
 getcontext().prec = 28
 
@@ -37,17 +46,18 @@ def now() -> str:
     return now_utc10_dt().strftime("[%Y-%m-%d %H:%M:%S UTC+10]")
 
 # ---------------- ANSI Colors (can disable with NO_COLOR=1) ----------------
+NO_COLOR = os.environ.get("NO_COLOR") == "1"
 CLR = {
-    "reset": "" if os.environ.get("NO_COLOR") else "\033[0m",
-    "dim": ""   if os.environ.get("NO_COLOR") else "\033[2m",
-    "bold": ""  if os.environ.get("NO_COLOR") else "\033[1m",
-    "green": "" if os.environ.get("NO_COLOR") else "\033[92m",
-    "red": ""   if os.environ.get("NO_COLOR") else "\033[91m",
-    "yellow": ""if os.environ.get("NO_COLOR") else "\033[93m",
-    "blue": ""  if os.environ.get("NO_COLOR") else "\033[94m",
-    "cyan": ""  if os.environ.get("NO_COLOR") else "\033[96m",
-    "mag": ""   if os.environ.get("NO_COLOR") else "\033[95m",
-    "gray": ""  if os.environ.get("NO_COLOR") else "\033[90m",
+    "reset": "" if NO_COLOR else "\033[0m",
+    "dim": ""   if NO_COLOR else "\033[2m",
+    "bold": ""  if NO_COLOR else "\033[1m",
+    "green": "" if NO_COLOR else "\033[92m",
+    "red": ""   if NO_COLOR else "\033[91m",
+    "yellow": ""if NO_COLOR else "\033[93m",
+    "blue": ""  if NO_COLOR else "\033[94m",
+    "cyan": ""  if NO_COLOR else "\033[96m",
+    "mag": ""   if NO_COLOR else "\033[95m",
+    "gray": ""  if NO_COLOR else "\033[90m",
 }
 def colorize(msg: str, color: str) -> str:
     code = CLR.get(color, "")
@@ -97,6 +107,9 @@ MF_LEAD_SEC     = int(os.environ.get("MF_LEAD_SEC", "8000"))
 # Optional 3rd confirmation webhook (provision)
 ENABLE_THIRD_CONFIRMATION = os.environ.get("ENABLE_THIRD_CONFIRMATION", "0") == "1"
 
+# Heartbeat logging (prevents “quiet logs look dead”)
+DASH_HEARTBEAT_SEC = int(os.environ.get("DASH_HEARTBEAT_SEC", "60"))
+
 # ---------------- Credentials (env-first; fallback to your current keys) ----------------
 api_creds = {
     "key":        os.environ.get("APEX_API_KEY",        "3e965beb-41e2-f125-a7c5-569f45bfba21"),
@@ -116,7 +129,6 @@ client = HttpPrivateSign(
 )
 client.configs_v3()
 http_public = HttpPublic(APEX_OMNI_HTTP_MAIN)
-
 # ---------------- Safe Decimal + Rounding ----------------
 def _D(x) -> Decimal:
     return x if isinstance(x, Decimal) else Decimal(str(x))
@@ -279,15 +291,20 @@ def get_public_price() -> Decimal:
         return vb
 
     raise ValueError("No valid mark/index/last price (ApeX) and Binance fallback failed")
+
 # ---------------- Dashboard ----------------
 DASH_LAST = {"bias": None, "connected": False}
+
 def dash(event: str, msg: str, *, extra: Optional[dict] = None):
+    """Console dashboard printer (flushed for Render)."""
     icons = {"start":"🚀","ok":"✅","warn":"⚠️","error":"❌","signal":"🔔","state":"🖥️","trade":"📈","debug":"🔎"}
     colors = {"start":"cyan","ok":"green","warn":"yellow","error":"red","signal":"mag","state":"blue","trade":"green","debug":"gray"}
     icon = icons.get(event, "•"); col = colors.get(event, "reset")
     payload = f"{now()} {icon} {msg}"
-    if extra: payload += f" {CLR['dim']}{extra}{CLR['reset']}" if CLR['dim'] else f" {extra}"
-    print(colorize(payload, col))
+    if extra:
+        dim_l = CLR['dim']; dim_r = CLR['reset'] if CLR['dim'] else ""
+        payload += f" {dim_l}{extra}{dim_r}" if dim_l else f" {extra}"
+    print(colorize(payload, col), flush=True)  # <-- critical: flush
 
 def dash_startup():
     if not DASH_LAST["connected"]:
@@ -302,7 +319,7 @@ def dash_bias(new_bias: Optional[str]):
         DASH_LAST["bias"] = new_bias
         human = new_bias if new_bias else "NEUTRAL"
         color = "green" if new_bias == "LONG" else "red" if new_bias == "SHORT" else "yellow"
-        print(colorize(f"{now()} 🧭 ICT Bias → {human}", color))
+        print(colorize(f"{now()} 🧭 ICT Bias → {human}", color), flush=True)
 
 # ---------------- Bias via Binance (1h) — hardened ----------------
 BIAS: Optional[str] = None
@@ -416,9 +433,7 @@ def compute_ict_bias_from_candles(df: pd.DataFrame) -> Optional[str]:
     return None
 
 def compute_bias():
-    """
-    Hardened bias updater with sticky fallback to avoid NEUTRAL flips on transient network hiccups.
-    """
+    """Hardened bias updater with sticky fallback."""
     global BIAS, _LAST_BIAS_TS
     try:
         limit = max(EMA_PERIOD + 200, 300)
@@ -436,7 +451,6 @@ def compute_bias():
                 dash("debug", "ICT Bias: insufficient data")
             return
 
-            decided = None  # guard (will not hit)
         decided = compute_ict_bias_from_candles(df)
         if decided != BIAS:
             BIAS = decided
@@ -511,7 +525,6 @@ def capmgr_release(amount_usdt: Decimal) -> Optional[dict]:
 
 def capmgr_on_close() -> Optional[dict]:
     return _http_post_json(f"{CAPMGR_URL}/on_close", {"bot_id": BOT_ID})
-
 # ---------------- Runtime State ----------------
 STATE: Dict[str, Any] = {
     "running": True,
@@ -595,6 +608,7 @@ def _full_reset(reason: str):
         STATE["mf_flip_since_entry"] = False
 
     dash("trade", f"EXIT by {reason} — ready for next entry")
+
 # ---------------- TP/SL utils (bias-aware selection) ----------------
 def pick_tp_sl_pcts(entry_side: str) -> Tuple[Decimal, Decimal]:
     if BIAS is None:
@@ -768,7 +782,7 @@ def check_and_latch(desired_side: Optional[str]) -> Optional[str]:
         return None
     return desired_side
 
-# ---------------- Webhook helpers: accept JSON/form/raw & respond instantly ----------------
+# ---------------- Webhook helpers ----------------
 def _async(fn, *args, **kwargs):
     threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True).start()
 
@@ -868,6 +882,7 @@ def webhook_confirm():
     except Exception as e:
         dash("warn", f"webhook_confirm handler error: {e}")
         return jsonify({"ok": False, "error": "handler_exception"}), 200
+
 # ---------------- Force Test Entry ----------------
 @app.route("/test/force_entry", methods=["POST","GET"], strict_slashes=False)
 def test_force_entry():
@@ -947,7 +962,6 @@ def ping():
 def admin_reset_state():
     _full_reset("ADMIN")
     return jsonify({"ok": True, "msg": "state reset"}), 200
-
 # ---------------- Background Threads ----------------
 def bg_bias_loop():
     dash_startup()
@@ -976,19 +990,46 @@ def bg_monitor_loop():
             dash("warn", f"monitor loop error: {e}")
             time.sleep(2)
 
+def bg_heartbeat_loop():
+    """Periodic status line so logs never go totally quiet on Render."""
+    while STATE["running"]:
+        try:
+            with POSITION_LOCK:
+                pos_snapshot = {
+                    "open": POSITION["open"],
+                    "side": POSITION["side"],
+                    "size": str(POSITION["size"]) if POSITION["size"] else None,
+                    "entry": str(POSITION["entry"]) if POSITION["entry"] else None,
+                    "tp": str(POSITION["tp"]) if POSITION["tp"] else None,
+                    "sl": str(POSITION["sl"]) if POSITION["sl"] else None,
+                }
+            dash("state", "heartbeat", extra={
+                "bias": BIAS,
+                "mf_last": STATE["last_mf"],
+                "trend_last": STATE["last_trend"],
+                "position": pos_snapshot
+            })
+            time.sleep(max(10, DASH_HEARTBEAT_SEC))
+        except Exception as e:
+            dash("warn", f"heartbeat error: {e}")
+            time.sleep(10)
+
 _THREADS_STARTED = False
 def start_background_threads_once():
     global _THREADS_STARTED
     if _THREADS_STARTED:
         return
-    threading.Thread(target=bg_bias_loop,   name="bias",    daemon=True).start()
-    threading.Thread(target=bg_monitor_loop,name="monitor", daemon=True).start()
-    threading.Thread(target=tp_sl_watchdog, name="tp_sl",   daemon=True).start()
+    threading.Thread(target=bg_bias_loop,     name="bias",      daemon=True).start()
+    threading.Thread(target=bg_monitor_loop,  name="monitor",   daemon=True).start()
+    threading.Thread(target=tp_sl_watchdog,   name="tp_sl",     daemon=True).start()
+    threading.Thread(target=bg_heartbeat_loop,name="heartbeat", daemon=True).start()
     _THREADS_STARTED = True
 
 def boot_on_import():
     # Called at module import (so gunicorn workers start processing immediately)
     dash_startup()
+    # Capital Manager connectivity check (non-fatal)
+    dash("state", "Pinging Capital Manager…", extra={"url": CAPMGR_URL})
     ping_capital_manager()
     dash_capital_status_once()
     start_background_threads_once()
