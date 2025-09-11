@@ -1,5 +1,3 @@
-# app_btc_v1_4.py — Apex Omni BTC Bot (v1.4) — Render-ready + reliable dash logging
-
 import os
 import sys
 import json
@@ -23,7 +21,6 @@ from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.http_public import HttpPublic
 
 # --------- make stdout/stderr line-buffered so Render logs don't “freeze” ----------
-# (PYTHONUNBUFFERED=1 is also recommended in Render env vars)
 try:
     sys.stdout.reconfigure(line_buffering=True)  # py>=3.7
     sys.stderr.reconfigure(line_buffering=True)
@@ -79,7 +76,7 @@ ICT_REQUIRE_BOS    = False
 DEBUG_BIAS         = True
 
 # Trade gates
-USE_BIAS            = False     # trade only with bias
+USE_BIAS            = False     # trade only with bias when True
 ALLOW_COUNTER_TREND = True      # allow against bias if True
 
 # Exchange tick/steps (ApeX BTC)
@@ -129,6 +126,7 @@ client = HttpPrivateSign(
 )
 client.configs_v3()
 http_public = HttpPublic(APEX_OMNI_HTTP_MAIN)
+
 # ---------------- Safe Decimal + Rounding ----------------
 def _D(x) -> Decimal:
     return x if isinstance(x, Decimal) else Decimal(str(x))
@@ -284,7 +282,6 @@ def get_public_price() -> Decimal:
     except Exception as e:
         dash("warn", f"http_public.ticker_v3 error: {e}")
 
-    # Fallback: Binance
     vb = _binance_ticker_price(BINANCE_SYMBOL)
     if vb and vb > 0:
         dash("state", "Price fallback used (Binance)")
@@ -304,7 +301,7 @@ def dash(event: str, msg: str, *, extra: Optional[dict] = None):
     if extra:
         dim_l = CLR['dim']; dim_r = CLR['reset'] if CLR['dim'] else ""
         payload += f" {dim_l}{extra}{dim_r}" if dim_l else f" {extra}"
-    print(colorize(payload, col), flush=True)  # <-- critical: flush
+    print(colorize(payload, col), flush=True)
 
 def dash_startup():
     if not DASH_LAST["connected"]:
@@ -468,7 +465,6 @@ def compute_bias():
             BIAS = None
             dash_bias(BIAS)
         dash("warn", f"ICT Bias error: {e}")
-
 # ---------------- Capital Manager HTTP helpers ----------------
 def _http_get_json(url: str, timeout: float = 2.0) -> Optional[dict]:
     try:
@@ -525,6 +521,7 @@ def capmgr_release(amount_usdt: Decimal) -> Optional[dict]:
 
 def capmgr_on_close() -> Optional[dict]:
     return _http_post_json(f"{CAPMGR_URL}/on_close", {"bot_id": BOT_ID})
+
 # ---------------- Runtime State ----------------
 STATE: Dict[str, Any] = {
     "running": True,
@@ -746,7 +743,6 @@ def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None)
                 capmgr_release(_D(res))
                 POSITION["reserved_margin"] = None
         return None
-
 # ---------------- Latching / Bias gate ----------------
 def _within_window(ts_a: int, ts_b: int) -> bool:
     dt = ts_b - ts_a
@@ -781,6 +777,51 @@ def check_and_latch(desired_side: Optional[str]) -> Optional[str]:
     if ENABLE_THIRD_CONFIRMATION and not STATE["last_confirm"]:
         return None
     return desired_side
+
+# ---------------- Instant exit on TREND flip + re-latch support ----------------
+def close_position_market(reason: str) -> bool:
+    """Instant reduce-only MARKET close of the current position, cancel TP/SL, then clean reset."""
+    try:
+        with POSITION_LOCK:
+            if not POSITION["open"]:
+                return False
+            cur_side = POSITION.get("side")
+            size     = POSITION.get("size")
+            tp_id    = POSITION.get("tp_id")
+            sl_id    = POSITION.get("sl_id")
+
+        # Cancel protection orders first
+        if tp_id: _cancel_id(tp_id, "TP")
+        if sl_id: _cancel_id(sl_id, "SL")
+
+        # Reduce-only market close
+        mark = get_public_price()
+        price_str = fmt_price(floor_to_tick(mark))
+        size_str  = fmt_size(size)
+        opp = "SELL" if cur_side == "LONG" else "BUY"
+
+        resp = client.create_order_v3(
+            symbol=APEX_SYMBOL, side=opp, type="MARKET",
+            size=size_str, price=price_str, reduceOnly=True,
+            timestampSeconds=int(time.time())
+        )
+        dash("trade", f"EXIT MARKET by {reason}",
+             extra={"closed_side": cur_side, "size": size_str, "hint_price": price_str, "resp": (resp.get("data") or {})})
+    except Exception as e:
+        dash("warn", f"close_position_market error: {e}")
+    finally:
+        _full_reset(reason)
+    return True
+
+def _attempt_latch_after_close(desired_side: str):
+    """Small delay so close completes, then attempt bias/mf window latch for re-entry."""
+    try:
+        time.sleep(0.25)
+        side = check_and_latch(desired_side)
+        if side:
+            place_market_order(side)
+    except Exception as e:
+        dash("warn", f"_attempt_latch_after_close error: {e}")
 
 # ---------------- Webhook helpers ----------------
 def _async(fn, *args, **kwargs):
@@ -855,11 +896,26 @@ def webhook_trend():
         else:
             return jsonify({"ok": False, "reason": "message must contain TREND UP or TREND DOWN"}), 200
 
+        # Latch the new trend immediately
         STATE["last_trend"] = {"dir": d, "ts": ts}
         dash("signal", f"TREND {d}", extra={"ts": ts, "raw": msg})
 
-        desired = "LONG" if d=="UP" else "SHORT"
-        if not POSITION["open"]:
+        desired = "LONG" if d == "UP" else "SHORT"
+
+        # If there is a live position in the opposite direction → instant market close
+        with POSITION_LOCK:
+            open_ = POSITION["open"]
+            cur_side = POSITION.get("side")
+
+        if open_ and cur_side and cur_side != desired:
+            dash("state", "TREND flip detected — closing current position now",
+                 extra={"from": cur_side, "to": desired})
+            _async(close_position_market, "TREND_FLIP")
+            _async(_attempt_latch_after_close, desired)
+            return jsonify({"ok": True, "flip_exit": True, "to": desired, "ts": ts}), 200
+
+        # If flat (or already same direction), normal latch check
+        if not open_:
             side = check_and_latch(desired)
             if side:
                 _async(place_market_order, side)
@@ -882,7 +938,6 @@ def webhook_confirm():
     except Exception as e:
         dash("warn", f"webhook_confirm handler error: {e}")
         return jsonify({"ok": False, "error": "handler_exception"}), 200
-
 # ---------------- Force Test Entry ----------------
 @app.route("/test/force_entry", methods=["POST","GET"], strict_slashes=False)
 def test_force_entry():
@@ -962,6 +1017,7 @@ def ping():
 def admin_reset_state():
     _full_reset("ADMIN")
     return jsonify({"ok": True, "msg": "state reset"}), 200
+
 # ---------------- Background Threads ----------------
 def bg_bias_loop():
     dash_startup()
@@ -1028,7 +1084,6 @@ def start_background_threads_once():
 def boot_on_import():
     # Called at module import (so gunicorn workers start processing immediately)
     dash_startup()
-    # Capital Manager connectivity check (non-fatal)
     dash("state", "Pinging Capital Manager…", extra={"url": CAPMGR_URL})
     ping_capital_manager()
     dash_capital_status_once()
