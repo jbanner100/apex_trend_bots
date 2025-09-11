@@ -1,4 +1,4 @@
-# app_btc_render.py — Apex Omni BTC Bot (Render-ready, v1.4R)
+# app_btc_v1_4.py — Apex Omni BTC Bot (v1.4) — Render-ready
 
 import os
 import json
@@ -6,14 +6,15 @@ import threading
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, getcontext
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import pandas as pd
 import ccxt
 from flask import Flask, request, jsonify
 
-# stdlib HTTP (no external "requests" dep needed)
+# stdlib HTTP (no external "requests" dep)
 import urllib.request
+import urllib.error
 
 # === ApeX API imports ===
 from apexomni.constants import APEX_OMNI_HTTP_MAIN, NETWORKID_OMNI_MAIN_ARB
@@ -25,7 +26,7 @@ getcontext().prec = 28
 
 # ---------------- App ----------------
 app = Flask(__name__)
-APP_NAME = "Apex Omni BTC Bot (v1.4R)"
+APP_NAME = "Apex Omni BTC Bot (v1.4)"
 STARTED_AT_UTC = datetime.utcnow().isoformat() + "Z"
 
 # ---------------- Timezone (UTC+10) ----------------
@@ -35,53 +36,55 @@ def now_utc10_dt() -> datetime:
 def now() -> str:
     return now_utc10_dt().strftime("[%Y-%m-%d %H:%M:%S UTC+10]")
 
-# ---------------- ANSI Colors ----------------
+# ---------------- ANSI Colors (can disable with NO_COLOR=1) ----------------
 CLR = {
-    "reset": "\033[0m",
-    "dim": "\033[2m",
-    "bold": "\033[1m",
-    "green": "\033[92m",
-    "red": "\033[91m",
-    "yellow": "\033[93m",
-    "blue": "\033[94m",
-    "cyan": "\033[96m",
-    "mag": "\033[95m",
-    "gray": "\033[90m",
+    "reset": "" if os.environ.get("NO_COLOR") else "\033[0m",
+    "dim": ""   if os.environ.get("NO_COLOR") else "\033[2m",
+    "bold": ""  if os.environ.get("NO_COLOR") else "\033[1m",
+    "green": "" if os.environ.get("NO_COLOR") else "\033[92m",
+    "red": ""   if os.environ.get("NO_COLOR") else "\033[91m",
+    "yellow": ""if os.environ.get("NO_COLOR") else "\033[93m",
+    "blue": ""  if os.environ.get("NO_COLOR") else "\033[94m",
+    "cyan": ""  if os.environ.get("NO_COLOR") else "\033[96m",
+    "mag": ""   if os.environ.get("NO_COLOR") else "\033[95m",
+    "gray": ""  if os.environ.get("NO_COLOR") else "\033[90m",
 }
 def colorize(msg: str, color: str) -> str:
-    return f"{CLR.get(color,'')}{msg}{CLR['reset']}"
+    code = CLR.get(color, "")
+    reset = CLR["reset"]
+    return f"{code}{msg}{reset}" if code else msg
 
 # ---------------- Config (BTC) ----------------
-APEX_SYMBOL        = os.environ.get("APEX_SYMBOL", "BTC-USDT")
-BINANCE_SYMBOL     = os.environ.get("BINANCE_SYMBOL", "BTC/USDT")
-BOT_ID             = os.environ.get("BOT_ID", "BTC")
+APEX_SYMBOL        = "BTC-USDT"
+BINANCE_SYMBOL     = "BTC/USDT"
+BOT_ID             = "BTC"
 
 # Bias TF (1h)
-BIAS_INTERVAL      = os.environ.get("BIAS_INTERVAL", "1h")
-EMA_PERIOD         = int(os.environ.get("EMA_PERIOD", "50"))
-ICT_EMA_SLOPE_BARS = int(os.environ.get("ICT_EMA_SLOPE_BARS", "10"))
-ICT_SWING_LOOKBACK = int(os.environ.get("ICT_SWING_LOOKBACK", "5"))
-ICT_BOS_BUFFER_PCT = Decimal(os.environ.get("ICT_BOS_BUFFER_PCT", "0.10"))
-ICT_REQUIRE_BOS    = (os.environ.get("ICT_REQUIRE_BOS", "false").lower() == "true")
-DEBUG_BIAS         = (os.environ.get("DEBUG_BIAS", "true").lower() == "true")
+BIAS_INTERVAL      = "1h"
+EMA_PERIOD         = 50
+ICT_EMA_SLOPE_BARS = 10
+ICT_SWING_LOOKBACK = 5
+ICT_BOS_BUFFER_PCT = 0.10
+ICT_REQUIRE_BOS    = False
+DEBUG_BIAS         = True
 
 # Trade gates
-USE_BIAS            = (os.environ.get("USE_BIAS", "false").lower() == "true")
-ALLOW_COUNTER_TREND = (os.environ.get("ALLOW_COUNTER_TREND", "true").lower() == "true")
+USE_BIAS            = False     # trade only with bias
+ALLOW_COUNTER_TREND = True      # allow against bias if True
 
 # Exchange tick/steps (ApeX BTC)
-TICK_SIZE       = Decimal(os.environ.get("TICK_SIZE", "1"))
-SIZE_STEP       = Decimal(os.environ.get("SIZE_STEP", "0.001"))
-MIN_ORDER_USDT  = Decimal(os.environ.get("MIN_ORDER_USDT", "5"))
+TICK_SIZE       = Decimal("1")
+SIZE_STEP       = Decimal("0.001")
+MIN_ORDER_USDT  = Decimal("5")
 
-# Capital Manager service (must be a separate Render service or reachable URL)
-CAPMGR_URL      = os.environ.get("CAPMGR_URL", "http://127.0.0.1:5015")  # set to https://<your-capmgr>.onrender.com in Render
+# Capital Manager service (Render URL via env, fallback local)
+CAPMGR_URL      = os.environ.get("CAPMGR_URL", "http://127.0.0.1:5015")
 
 # Leverage & sizing
 LEVERAGE        = Decimal(os.environ.get("LEVERAGE", "15"))
-TRADE_SIZE_PCT  = Decimal(os.environ.get("TRADE_SIZE_PCT", "0.10"))   # % of allocation to request per entry
+TRADE_SIZE_PCT  = Decimal(os.environ.get("TRADE_SIZE_PCT", "0.15"))   # % of allocation per entry
 
-# Bias-aware TP/SL (fractions; 0.01 = 1%)
+# Bias-aware TP/SL (fractions; 0.002 = 0.2%)
 TREND_TP_PCT    = Decimal(os.environ.get("TREND_TP_PCT", "0.01"))
 TREND_SL_PCT    = Decimal(os.environ.get("TREND_SL_PCT", "0.0075"))
 CT_TP_PCT       = Decimal(os.environ.get("CT_TP_PCT", "0.0050"))
@@ -92,16 +95,16 @@ MF_WAIT_SEC     = int(os.environ.get("MF_WAIT_SEC", "8000"))
 MF_LEAD_SEC     = int(os.environ.get("MF_LEAD_SEC", "8000"))
 
 # Optional 3rd confirmation webhook (provision)
-ENABLE_THIRD_CONFIRMATION = (os.environ.get("ENABLE_THIRD_CONFIRMATION", "false").lower() == "true")
+ENABLE_THIRD_CONFIRMATION = os.environ.get("ENABLE_THIRD_CONFIRMATION", "0") == "1"
 
-# ---------------- Credentials ----------------
+# ---------------- Credentials (env-first; fallback to your current keys) ----------------
 api_creds = {
-    "key":        os.environ.get("APEX_KEY",        "3e965beb-41e2-f125-a7c5-569f45bfba21"),
-    "secret":     os.environ.get("APEX_SECRET",     "NXtuAyq4hS9G4fVlytQtQGn9Qk5LUukXGAYg8SBj"),
-    "passphrase": os.environ.get("APEX_PASSPHRASE", "GEy6yNGaZ5_0fuX4VBJ3"),
+    "key":        os.environ.get("APEX_API_KEY",        "3e965beb-41e2-f125-a7c5-569f45bfba21"),
+    "secret":     os.environ.get("APEX_API_SECRET",     "NXtuAyq4hS9G4fVlytQtQGn9Qk5LUukXGAYg8SBj"),
+    "passphrase": os.environ.get("APEX_API_PASSPHRASE", "GEy6yNGaZ5_0fuX4VBJ3"),
 }
-zk_seeds = os.environ.get("APEX_ZK_SEEDS", "0xd00ec9396facbafc423b5d92a289ea49adfdb0b918d3d5db26edbb978893ed5d0bd48c3fbe4309de2a09a3514cbec6d2c4012df85653a1421aca1cf599acda491c")
-zk_l2Key = os.environ.get("APEX_ZK_L2KEY", "0xd6094a658c50dccf9be8f85cde1804e92a74a0482788766c9b8744cbc6fe8501")
+zk_seeds = os.environ.get("ZK_SEEDS", "0xd00ec9396facbafc423b5d92a289ea49adfdb0b918d3d5db26edbb978893ed5d0bd48c3fbe4309de2a09a3514cbec6d2c4012df85653a1421aca1cf599acda491c")
+zk_l2Key = os.environ.get("ZK_L2KEY", "0xd6094a658c50dccf9be8f85cde1804e92a74a0482788766c9b8744cbc6fe8501")
 
 # ---------------- ApeX Clients ----------------
 client = HttpPrivateSign(
@@ -164,39 +167,118 @@ def ensure_min_notional(size: Decimal, price: Decimal) -> Decimal:
 def fmt_price(x: Decimal) -> str: return fmt_fixed(_D(x), TICK_SIZE)
 def fmt_size(x: Decimal)  -> str: return fmt_fixed(_D(x), SIZE_STEP)
 
-# ---------------- Accounts & Price ----------------
+# ---------------- Terminal states ----------------
+TERMINAL_STATES = {"FILLED", "TRIGGERED", "EXECUTED", "COMPLETED", "DONE"}
+
+# ---------------- ApeX circuit breaker ----------------
+API_MAX_TRIES = 4
+API_COOLDOWN_SEC = 30
+_APEX_CB = {"failures": 0, "open_until": 0.0}
+
+def _apex_circuit_open() -> bool:
+    return time.time() < _APEX_CB["open_until"]
+
+def _note_apex_failure():
+    _APEX_CB["failures"] += 1
+    if _APEX_CB["failures"] >= API_MAX_TRIES:
+        _APEX_CB["open_until"] = time.time() + API_COOLDOWN_SEC
+        _APEX_CB["failures"] = 0
+
+def _is_net_err(msg: str) -> bool:
+    m = msg.lower()
+    return any(k in m for k in ["timeout", "timed out", "dns", "name or service", "temporary failure", "max retries"])
+
+def _apex_backoff_sleep(i: int):
+    time.sleep(min(0.5 * (2 ** i), 6.0))
+
+# ---------------- Accounts & Price (with resilient fallbacks) ----------------
 def get_usdt_contract_balance() -> Decimal:
     try:
-        acct = client.get_account_v3()
-        for w in acct.get("contractWallets", []):
-            if w.get("token") == "USDT":
-                return Decimal(str(w.get("balance", "0")))
+        if _apex_circuit_open():
+            raise RuntimeError("APEX circuit open; skipping account read temporarily")
+        last_err = None
+        for i in range(API_MAX_TRIES):
+            try:
+                acct = client.get_account_v3()
+                for w in acct.get("contractWallets", []):
+                    if w.get("token") == "USDT":
+                        return Decimal(str(w.get("balance", "0")))
+                return Decimal("0")
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                dash("warn", f"get_usdt_contract_balance error: {msg}")
+                if _is_net_err(msg):
+                    _apex_backoff_sleep(i); continue
+                break
+        _note_apex_failure()
+        if last_err: raise last_err
     except Exception as e:
-        dash("warn", f"get_usdt_contract_balance error: {e}")
+        dash("warn", f"get_usdt_contract_balance final error: {e}")
     return Decimal("0")
 
 def get_open_position() -> Optional[dict]:
     try:
-        acct = client.get_account_v3()
-        for p in acct.get("positions", []):
-            if p.get("symbol") == APEX_SYMBOL and Decimal(str(p.get("size", "0"))) != Decimal("0"):
-                return p
+        if _apex_circuit_open():
+            raise RuntimeError("APEX circuit open; skipping get_open_position temporarily")
+        last_err = None
+        for i in range(API_MAX_TRIES):
+            try:
+                acct = client.get_account_v3()
+                for p in acct.get("positions", []):
+                    if p.get("symbol") == APEX_SYMBOL and Decimal(str(p.get("size", "0"))) != Decimal("0"):
+                        return p
+                return None
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                dash("warn", f"get_open_position error: {msg}")
+                if _is_net_err(msg):
+                    _apex_backoff_sleep(i); continue
+                break
+        _note_apex_failure()
+        if last_err: raise last_err
     except Exception as e:
-        dash("warn", f"get_open_position error: {e}")
+        dash("warn", f"get_open_position final error: {e}")
+    return None
+
+def _binance_ticker_price(symbol_ccxt: str) -> Optional[Decimal]:
+    try:
+        ex = ccxt.binance({"timeout": 20000, "enableRateLimit": True})
+        t = ex.fetch_ticker(symbol_ccxt)
+        for k in ("info", "last", "close"):
+            v = t.get(k)
+            if v is None: continue
+            try:
+                return _D_safe(v) if k == "info" else _D(v)
+            except Exception:
+                continue
+    except Exception:
+        pass
     return None
 
 def get_public_price() -> Decimal:
     """
-    Prefer markPrice → indexPrice → lastPrice. Always return > 0 or raise.
+    Prefer markPrice → indexPrice → lastPrice from ApeX; fallback to Binance last/close.
+    Always return > 0 or raise.
     """
-    t = http_public.ticker_v3(symbol=APEX_SYMBOL)
-    row = (t.get("data") or [{}])[0]
-    for key in ("markPrice","indexPrice","lastPrice"):
-        v = _D_safe(row.get(key))
-        if v is not None and v > 0:
-            return v
-    raise ValueError("No valid mark/index/last price")
+    try:
+        t = http_public.ticker_v3(symbol=APEX_SYMBOL)
+        row = (t.get("data") or [{}])[0]
+        for key in ("markPrice","indexPrice","lastPrice"):
+            v = _D_safe(row.get(key))
+            if v is not None and v > 0:
+                return v
+    except Exception as e:
+        dash("warn", f"http_public.ticker_v3 error: {e}")
 
+    # Fallback: Binance
+    vb = _binance_ticker_price(BINANCE_SYMBOL)
+    if vb and vb > 0:
+        dash("state", "Price fallback used (Binance)")
+        return vb
+
+    raise ValueError("No valid mark/index/last price (ApeX) and Binance fallback failed")
 # ---------------- Dashboard ----------------
 DASH_LAST = {"bias": None, "connected": False}
 def dash(event: str, msg: str, *, extra: Optional[dict] = None):
@@ -204,7 +286,7 @@ def dash(event: str, msg: str, *, extra: Optional[dict] = None):
     colors = {"start":"cyan","ok":"green","warn":"yellow","error":"red","signal":"mag","state":"blue","trade":"green","debug":"gray"}
     icon = icons.get(event, "•"); col = colors.get(event, "reset")
     payload = f"{now()} {icon} {msg}"
-    if extra is not None: payload += f" {CLR['dim']}{extra}{CLR['reset']}"
+    if extra: payload += f" {CLR['dim']}{extra}{CLR['reset']}" if CLR['dim'] else f" {extra}"
     print(colorize(payload, col))
 
 def dash_startup():
@@ -214,7 +296,6 @@ def dash_startup():
         dash("ok", "ApeX client initialized", extra={"endpoint": APEX_OMNI_HTTP_MAIN})
         dash("state", f"USE_BIAS={USE_BIAS}, ALLOW_COUNTER_TREND={ALLOW_COUNTER_TREND}")
         dash("state", "Waiting for signals: MF + TREND", extra={"lead_sec": MF_LEAD_SEC, "wait_sec": MF_WAIT_SEC})
-        dash("state", "Render mode: expecting external Capital Manager", extra={"CAPMGR_URL": CAPMGR_URL})
 
 def dash_bias(new_bias: Optional[str]):
     if DASH_LAST["bias"] != new_bias:
@@ -223,32 +304,131 @@ def dash_bias(new_bias: Optional[str]):
         color = "green" if new_bias == "LONG" else "red" if new_bias == "SHORT" else "yellow"
         print(colorize(f"{now()} 🧭 ICT Bias → {human}", color))
 
-# ---------------- Bias via Binance (1h) ----------------
+# ---------------- Bias via Binance (1h) — hardened ----------------
 BIAS: Optional[str] = None
+BIAS_STALE_TTL_SEC = 1800
+_LAST_BIAS_TS = 0
+
+BINANCE_HOSTS = ["api.binance.com", "api1.binance.com", "api2.binance.com", "api3.binance.com"]
+_BINANCE_IDX = 0
+_BINANCE = None
+_LAST_MARKETS_LOAD = 0
+
+def _binance_client():
+    global _BINANCE, _LAST_MARKETS_LOAD
+    if _BINANCE is None:
+        _BINANCE = ccxt.binance({
+            "timeout": 25000,
+            "enableRateLimit": True,
+            "options": {"adjustForTimeDifference": True},
+            "hostname": BINANCE_HOSTS[_BINANCE_IDX],
+        })
+        try:
+            _BINANCE.load_markets(reload=False)
+            _LAST_MARKETS_LOAD = time.time()
+        except Exception as e:
+            dash("warn", f"binance load_markets error: {e}")
+    return _BINANCE
+
+def _rotate_binance_host():
+    global _BINANCE_IDX, _BINANCE
+    _BINANCE_IDX = (_BINANCE_IDX + 1) % len(BINANCE_HOSTS)
+    _BINANCE = None
 
 def fetch_binance_candles(symbol: str, interval: str, limit: int = 500) -> Optional[pd.DataFrame]:
-    try:
-        ex = ccxt.binance()
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe=interval, limit=limit)
-        if not ohlcv:
+    backoff = 0.4
+    for attempt in range(5):
+        try:
+            ex = _binance_client()
+            global _LAST_MARKETS_LOAD
+            if time.time() - _LAST_MARKETS_LOAD > 7200:
+                ex.load_markets(reload=True)
+                _LAST_MARKETS_LOAD = time.time()
+            ohlcv = ex.fetch_ohlcv(symbol, timeframe=interval, limit=limit)
+            if not ohlcv:
+                return None
+            df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+            return df
+        except Exception as e:
+            err = str(e)
+            dash("warn", f"fetch_binance_candles error: {err}")
+            if any(k in err.lower() for k in ["timeout", "timed out", "temporary failure", "name or service", "dns", "exchangeinfo", "429"]):
+                if attempt < 4:
+                    _rotate_binance_host()
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 8.0)
+                    continue
             return None
-        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-        return df
-    except Exception as e:
-        dash("warn", f"fetch_binance_candles error: {e}")
-        return None
+    return None
 
 def compute_ema(df: pd.DataFrame, period: int) -> pd.DataFrame:
     df = df.copy()
     df["ema"] = df["close"].ewm(span=period, adjust=False).mean()
     return df
 
+def compute_ict_bias_from_candles(df: pd.DataFrame) -> Optional[str]:
+    closes = df["close"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+    df = compute_ema(df, EMA_PERIOD)
+    emas   = df["ema"].values
+
+    lb = int(ICT_SWING_LOOKBACK)
+    swh = [False] * len(df)
+    swl = [False] * len(df)
+    for i in range(lb, len(df) - lb):
+        if highs[i] > max(highs[i - lb:i]) and highs[i] >= max(highs[i + 1:i + 1 + lb]):
+            swh[i] = True
+        if lows[i] < min(lows[i - lb:i]) and lows[i] <= min(lows[i + 1:i + 1 + lb]):
+            swl[i] = True
+
+    buffer_frac = float(ICT_BOS_BUFFER_PCT) / 100.0
+    bos_events = []
+    for i, v in enumerate(swh):
+        if v:
+            level = highs[i]; thresh = level * (1.0 + buffer_frac)
+            j = next((k for k in range(i + 1, len(df)) if closes[k] > thresh), None)
+            if j is not None: bos_events.append((j, "UP"))
+    for i, v in enumerate(swl):
+        if v:
+            level = lows[i]; thresh = level * (1.0 - buffer_frac)
+            j = next((k for k in range(i + 1, len(df)) if closes[k] < thresh), None)
+            if j is not None: bos_events.append((j, "DOWN"))
+
+    last_bos_dir = None
+    if bos_events:
+        _, last_bos_dir = max(bos_events, key=lambda x: x[0])
+
+    ema_up = emas[-1] > emas[-1 - ICT_EMA_SLOPE_BARS]
+    ema_down = emas[-1] < emas[-1 - ICT_EMA_SLOPE_BARS]
+    price_above = closes[-1] > emas[-1]
+    price_below = closes[-1] < emas[-1]
+
+    if last_bos_dir == "UP" and ema_up and price_above:
+        return "LONG"
+    if last_bos_dir == "DOWN" and ema_down and price_below:
+        return "SHORT"
+
+    if not ICT_REQUIRE_BOS:
+        if ema_up and price_above:   return "LONG"
+        if ema_down and price_below: return "SHORT"
+
+    return None
+
 def compute_bias():
-    global BIAS
+    """
+    Hardened bias updater with sticky fallback to avoid NEUTRAL flips on transient network hiccups.
+    """
+    global BIAS, _LAST_BIAS_TS
     try:
         limit = max(EMA_PERIOD + 200, 300)
         df = fetch_binance_candles(BINANCE_SYMBOL, BIAS_INTERVAL, limit=limit)
         if df is None or df.empty or len(df) < EMA_PERIOD + ICT_EMA_SLOPE_BARS + 10:
+            age = int(time.time()) - _LAST_BIAS_TS
+            if BIAS is not None and age <= BIAS_STALE_TTL_SEC:
+                if DEBUG_BIAS:
+                    dash("debug", "ICT Bias: data hiccup — keeping previous", extra={"bias": BIAS, "age_s": age})
+                return
             if BIAS is not None:
                 BIAS = None
                 dash_bias(BIAS)
@@ -256,85 +436,27 @@ def compute_bias():
                 dash("debug", "ICT Bias: insufficient data")
             return
 
-        df = compute_ema(df, EMA_PERIOD)
-        closes = df["close"].values
-        highs  = df["high"].values
-        lows   = df["low"].values
-        emas   = df["ema"].values
-
-        lb = int(ICT_SWING_LOOKBACK)
-        swh = [False] * len(df)
-        swl = [False] * len(df)
-        for i in range(lb, len(df) - lb):
-            if highs[i] > max(highs[i - lb:i]) and highs[i] >= max(highs[i + 1:i + 1 + lb]):
-                swh[i] = True
-            if lows[i] < min(lows[i - lb:i]) and lows[i] <= min(lows[i + 1:i + 1 + lb]):
-                swl[i] = True
-
-        buffer_frac = float(ICT_BOS_BUFFER_PCT) / 100.0
-        bos_events = []
-        for i, v in enumerate(swh):
-            if v:
-                level = highs[i]; thresh = level * (1.0 + buffer_frac)
-                j = next((k for k in range(i + 1, len(df)) if closes[k] > thresh), None)
-                if j is not None: bos_events.append((j, "UP"))
-        for i, v in enumerate(swl):
-            if v:
-                level = lows[i]; thresh = level * (1.0 - buffer_frac)
-                j = next((k for k in range(i + 1, len(df)) if closes[k] < thresh), None)
-                if j is not None: bos_events.append((j, "DOWN"))
-
-        last_bos_dir = None
-        if bos_events:
-            _, last_bos_dir = max(bos_events, key=lambda x: x[0])
-
-        ema_up = emas[-1] > emas[-1 - ICT_EMA_SLOPE_BARS]
-        ema_down = emas[-1] < emas[-1 - ICT_EMA_SLOPE_BARS]
-        price_above = closes[-1] > emas[-1]
-        price_below = closes[-1] < emas[-1]
-
-        decided = None
-        if last_bos_dir == "UP" and ema_up and price_above:
-            decided = "LONG"
-        elif last_bos_dir == "DOWN" and ema_down and price_below:
-            decided = "SHORT"
-        else:
-            if not ICT_REQUIRE_BOS:
-                if ema_up and price_above:   decided = "LONG"
-                elif ema_down and price_below: decided = "SHORT"
-                else: decided = None
-            else:
-                decided = None
-
+            decided = None  # guard (will not hit)
+        decided = compute_ict_bias_from_candles(df)
         if decided != BIAS:
             BIAS = decided
             dash_bias(BIAS)
+        _LAST_BIAS_TS = int(time.time())
 
         if DEBUG_BIAS:
             dash("debug", f"Bias calc done", extra={"bias": BIAS})
-
     except Exception as e:
+        age = int(time.time()) - _LAST_BIAS_TS
+        if BIAS is not None and age <= BIAS_STALE_TTL_SEC:
+            dash("warn", f"Bias error; keeping previous bias (age {age}s): {e}")
+            return
         if BIAS is not None:
             BIAS = None
             dash_bias(BIAS)
         dash("warn", f"ICT Bias error: {e}")
 
-# ---------------- TP/SL utils (bias-aware selection) ----------------
-def pick_tp_sl_pcts(entry_side: str) -> Tuple[Decimal, Decimal]:
-    if BIAS is None:
-        return TREND_TP_PCT, TREND_SL_PCT
-    return ((TREND_TP_PCT, TREND_SL_PCT) if entry_side == BIAS else (CT_TP_PCT, CT_SL_PCT))
-
-def tp_price_from(entry: Decimal, side: str, pct: Decimal) -> Decimal:
-    entry = _D(entry); pct = _D(pct)
-    return entry * (Decimal("1")+pct) if side=="LONG" else entry * (Decimal("1")-pct)
-
-def sl_price_from(entry: Decimal, side: str, pct: Decimal) -> Decimal:
-    entry = _D(entry); pct = _D(pct)
-    return entry * (Decimal("1")-pct) if side=="LONG" else entry * (Decimal("1")+pct)
-
 # ---------------- Capital Manager HTTP helpers ----------------
-def _http_get_json(url: str, timeout: float = 3.0) -> Optional[dict]:
+def _http_get_json(url: str, timeout: float = 2.0) -> Optional[dict]:
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -342,7 +464,7 @@ def _http_get_json(url: str, timeout: float = 3.0) -> Optional[dict]:
     except Exception:
         return None
 
-def _http_post_json(url: str, payload: dict, timeout: float = 5.0) -> Optional[dict]:
+def _http_post_json(url: str, payload: dict, timeout: float = 3.0) -> Optional[dict]:
     try:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type":"application/json"}, method="POST")
@@ -351,14 +473,17 @@ def _http_post_json(url: str, payload: dict, timeout: float = 5.0) -> Optional[d
     except Exception:
         return None
 
-def capmgr_up() -> bool:
+def ping_capital_manager():
+    dash("state", "Pinging Capital Manager…", extra={"url": CAPMGR_URL})
     h = _http_get_json(f"{CAPMGR_URL}/health")
-    return bool(h and h.get("ok"))
+    if h and h.get("ok"):
+        dash("ok", "Capital Manager reachable", extra={"url": CAPMGR_URL})
+    else:
+        dash("warn", "Capital Manager not reachable (bot will still run)")
 
 def dash_capital_status_once():
     h = _http_get_json(f"{CAPMGR_URL}/health")
     if not (h and h.get("ok")):
-        dash("warn", "Capital Manager not reachable", extra={"url": CAPMGR_URL})
         return
     bot_row = None
     for b in (h.get("bots") or []):
@@ -368,8 +493,7 @@ def dash_capital_status_once():
         "wallet_usdt": h.get("wallet_usdt"),
         "bot": BOT_ID,
         "symbol": APEX_SYMBOL,
-        "initial_trade_pct": str(TRADE_SIZE_PCT),
-        "url": CAPMGR_URL
+        "initial_trade_pct": str(TRADE_SIZE_PCT)
     }
     if bot_row:
         extra.update({
@@ -389,14 +513,14 @@ def capmgr_on_close() -> Optional[dict]:
     return _http_post_json(f"{CAPMGR_URL}/on_close", {"bot_id": BOT_ID})
 
 # ---------------- Runtime State ----------------
-STATE = {
+STATE: Dict[str, Any] = {
     "running": True,
     "last_mf": None,           # {'dir':'UP'|'DOWN','ts':int}
     "last_trend": None,        # {'dir':'UP'|'DOWN','ts':int}
     "last_confirm": None,      # {'ts':int}
     "mf_flip_since_entry": False,
 }
-POSITION = {
+POSITION: Dict[str, Any] = {
     "open": False, "side": None, "entry": None, "size": None,
     "order_id": None, "tp_id": None, "sl_id": None, "tp": None, "sl": None,
     "margin": None, "reserved_margin": None,
@@ -406,18 +530,31 @@ POSITION = {
 POSITION_LOCK = threading.Lock()
 
 # ---------------- Terminal state helpers ----------------
-TERMINAL_STATES = {"FILLED", "TRIGGERED", "EXECUTED", "COMPLETED", "DONE"}
-
 def _ord_status(info: dict) -> str:
     return str((info or {}).get("status", "")).upper()
 
 def _fetch_order(order_id: str) -> dict:
     if not order_id: return {}
     try:
-        return client.get_order_v3(symbol=APEX_SYMBOL, orderId=str(order_id)).get("data") or {}
+        if _apex_circuit_open():
+            raise RuntimeError("APEX circuit open; skipping get_order_v3 temporarily")
+        last_err = None
+        for i in range(API_MAX_TRIES):
+            try:
+                return client.get_order_v3(symbol=APEX_SYMBOL, orderId=str(order_id)).get("data") or {}
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                dash("warn", "get_order_v3 error", extra={"id": order_id, "err": msg})
+                if _is_net_err(msg):
+                    _apex_backoff_sleep(i); continue
+                break
+        _note_apex_failure()
+        if last_err: raise last_err
     except Exception as e:
-        dash("warn", f"get_order_v3 error", extra={"id": order_id, "err": str(e)})
+        dash("warn", "get_order_v3 final error", extra={"id": order_id, "err": str(e)})
         return {}
+    return {}
 
 def _cancel_id(order_id: str, label: str):
     if not order_id: return
@@ -440,11 +577,11 @@ def _cancel_id(order_id: str, label: str):
 def _full_reset(reason: str):
     with POSITION_LOCK:
         tp_id = POSITION.get("tp_id"); sl_id = POSITION.get("sl_id")
-        reserved = POSITION.get("reserved_margin")
     if tp_id: _cancel_id(tp_id, "TP")
     if sl_id: _cancel_id(sl_id, "SL")
-    # Notify allocator (refresh & zero reservations for this bot)
+
     capmgr_on_close()
+
     with POSITION_LOCK:
         POSITION.update({
             "open": False, "side": None, "entry": None, "size": None,
@@ -456,7 +593,21 @@ def _full_reset(reason: str):
         STATE["last_trend"] = None
         STATE["last_confirm"] = None
         STATE["mf_flip_since_entry"] = False
+
     dash("trade", f"EXIT by {reason} — ready for next entry")
+# ---------------- TP/SL utils (bias-aware selection) ----------------
+def pick_tp_sl_pcts(entry_side: str) -> Tuple[Decimal, Decimal]:
+    if BIAS is None:
+        return TREND_TP_PCT, TREND_SL_PCT
+    return ((TREND_TP_PCT, TREND_SL_PCT) if entry_side == BIAS else (CT_TP_PCT, CT_SL_PCT))
+
+def tp_price_from(entry: Decimal, side: str, pct: Decimal) -> Decimal:
+    entry = _D(entry); pct = _D(pct)
+    return entry * (Decimal("1")+pct) if side=="LONG" else entry * (Decimal("1")-pct)
+
+def sl_price_from(entry: Decimal, side: str, pct: Decimal) -> Decimal:
+    entry = _D(entry); pct = _D(pct)
+    return entry * (Decimal("1")-pct) if side=="LONG" else entry * (Decimal("1")+pct)
 
 # ---------------- MARKET Entry (+ reduce-only TP/SL) ----------------
 def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None) -> Optional[str]:
@@ -473,11 +624,8 @@ def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None)
                  extra={"size": str(live.get("size")), "side": live.get("side")})
             return None
 
-        # Capital reservation
+        # Reserve from Capital Manager
         t_pct = TRADE_SIZE_PCT if trade_size_pct is None else (_D_safe(trade_size_pct) or TRADE_SIZE_PCT)
-        if not capmgr_up():
-            dash("warn", "Capital Manager unreachable — entry aborted", extra={"url": CAPMGR_URL})
-            return None
         r = capmgr_reserve(t_pct)
         if not r or not r.get("ok"):
             dash("error", "Capital reservation failed", extra={"resp": r})
@@ -494,9 +642,9 @@ def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None)
             dash("warn", "No capital available for this entry", extra={"trade_pct": str(t_pct)})
             return None
 
-        # Price & rounding
+        # Price & rounding (MARKET with price hint)
         mark_price = get_public_price()
-        mark_price_r = floor_to_tick(mark_price)
+        mark_price_r = floor_to_tick(mark_price)  # BTC tick=1
         price_str   = fmt_price(mark_price_r)
 
         # Size from (approved_margin * leverage) / price
@@ -555,8 +703,6 @@ def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None)
             reduceOnly=True, timestampSeconds=int(time.time())
         )
         tp_id = (tp_order.get("data") or {}).get("id")
-        if not tp_id:
-            dash("warn", "TP placement failed", extra={"resp": tp_order})
 
         # SL (STOP_MARKET)
         sl_order = client.create_order_v3(
@@ -565,8 +711,6 @@ def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None)
             reduceOnly=True, timestampSeconds=int(time.time())
         )
         sl_id = (sl_order.get("data") or {}).get("id")
-        if not sl_id:
-            dash("warn", "SL placement failed", extra={"resp": sl_order})
 
         with POSITION_LOCK:
             POSITION.update({
@@ -624,71 +768,106 @@ def check_and_latch(desired_side: Optional[str]) -> Optional[str]:
         return None
     return desired_side
 
-# ---------------- Webhooks ----------------
+# ---------------- Webhook helpers: accept JSON/form/raw & respond instantly ----------------
+def _async(fn, *args, **kwargs):
+    threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True).start()
+
+def _extract_message_and_ts():
+    try:
+        data = request.get_json(force=False, silent=True) or {}
+    except Exception:
+        data = {}
+    msg = data.get("message")
+    ts = data.get("ts")
+    if not msg:
+        msg = request.form.get("message")
+    if ts is None:
+        ts = request.form.get("ts")
+    if not msg:
+        raw = (request.data or b"").decode("utf-8", "ignore").strip()
+        if raw:
+            msg = raw
+    try:
+        ts = int(ts) if ts is not None else int(time.time())
+    except Exception:
+        ts = int(time.time())
+    return (msg or "").strip(), ts
+
 def parse_up_down(msg: str) -> Optional[str]:
     s = str(msg or "").upper()
     if "UP" in s: return "UP"
     if "DOWN" in s: return "DOWN"
     return None
 
+# ---------------- Webhooks (async, tolerant, always 200) ----------------
 @app.route("/webhook_mf", methods=["POST","GET"], strict_slashes=False)
 def webhook_mf():
     if request.method == "GET":
         return jsonify({"ok": True, "hint": 'POST {"message":"MF UP|MF DOWN","ts":<epoch optional>}'})
-    data = request.get_json(silent=True) or {}
-    d = parse_up_down(data.get("message"))
-    if d not in ("UP","DOWN"):
-        return jsonify({"ok": False, "reason": "message must contain MF UP or MF DOWN"}), 400
-    ts = int(data.get("ts") or time.time())
+    try:
+        msg, ts = _extract_message_and_ts()
+        d = parse_up_down(msg)
+        if d not in ("UP","DOWN"):
+            return jsonify({"ok": False, "reason": "message must contain MF UP or MF DOWN"}), 200
 
-    STATE["last_mf"] = {"dir": d, "ts": ts}
-    dash("signal", f"MF {d}", extra={"ts": ts})
+        STATE["last_mf"] = {"dir": d, "ts": ts}
+        dash("signal", f"MF {d}", extra={"ts": ts, "raw": msg})
 
-    if POSITION["open"]:
-        if POSITION["side"] == "LONG" and d == "DOWN": STATE["mf_flip_since_entry"] = True
-        if POSITION["side"] == "SHORT" and d == "UP":  STATE["mf_flip_since_entry"] = True
+        if POSITION["open"]:
+            if POSITION["side"] == "LONG" and d == "DOWN": STATE["mf_flip_since_entry"] = True
+            if POSITION["side"] == "SHORT" and d == "UP":  STATE["mf_flip_since_entry"] = True
 
-    desired = "LONG" if d=="UP" else "SHORT"
-    if not POSITION["open"]:
-        side = check_and_latch(desired)
-        if side:
-            oid = place_market_order(side)
-            return jsonify({"ok": bool(oid), "action": "entry", "side": side, "ts": ts})
-    return jsonify({"ok": True, "latched": False, "ts": ts})
+        desired = "LONG" if d=="UP" else "SHORT"
+        if not POSITION["open"]:
+            side = check_and_latch(desired)
+            if side:
+                _async(place_market_order, side)
+                return jsonify({"ok": True, "action": "entry_queued", "side": side, "ts": ts}), 200
+
+        return jsonify({"ok": True, "latched": False, "ts": ts}), 200
+    except Exception as e:
+        dash("warn", f"webhook_mf handler error: {e}")
+        return jsonify({"ok": False, "error": "handler_exception"}), 200
 
 @app.route("/webhook_trend", methods=["POST","GET"], strict_slashes=False)
 def webhook_trend():
     if request.method == "GET":
         return jsonify({"ok": True, "hint": 'POST {"message":"TREND UP|TREND DOWN","ts":<epoch optional>}'})
-    data = request.get_json(silent=True) or {}
-    s = str(data.get("message") or "").upper()
-    if "UP" in s: d = "UP"
-    elif "DOWN" in s: d = "DOWN"
-    else:
-        return jsonify({"ok": False, "reason": "message must contain TREND UP or TREND DOWN"}), 400
-    ts = int(data.get("ts") or time.time())
+    try:
+        msg, ts = _extract_message_and_ts()
+        s = (msg or "").upper()
+        if   "UP"   in s: d = "UP"
+        elif "DOWN" in s: d = "DOWN"
+        else:
+            return jsonify({"ok": False, "reason": "message must contain TREND UP or TREND DOWN"}), 200
 
-    STATE["last_trend"] = {"dir": d, "ts": ts}
-    dash("signal", f"TREND {d}", extra={"ts": ts})
+        STATE["last_trend"] = {"dir": d, "ts": ts}
+        dash("signal", f"TREND {d}", extra={"ts": ts, "raw": msg})
 
-    desired = "LONG" if d=="UP" else "SHORT"
-    if not POSITION["open"]:
-        side = check_and_latch(desired)
-        if side:
-            oid = place_market_order(side)
-            return jsonify({"ok": bool(oid), "action": "entry", "side": side, "ts": ts})
-    return jsonify({"ok": True, "latched": False, "ts": ts})
+        desired = "LONG" if d=="UP" else "SHORT"
+        if not POSITION["open"]:
+            side = check_and_latch(desired)
+            if side:
+                _async(place_market_order, side)
+                return jsonify({"ok": True, "action": "entry_queued", "side": side, "ts": ts}), 200
+
+        return jsonify({"ok": True, "latched": False, "ts": ts}), 200
+    except Exception as e:
+        dash("warn", f"webhook_trend handler error: {e}")
+        return jsonify({"ok": False, "error": "handler_exception"}), 200
 
 @app.route("/webhook_confirm", methods=["POST","GET"], strict_slashes=False)
 def webhook_confirm():
     if request.method == "GET":
         return jsonify({"ok": True, "hint": 'POST {"message":"CONFIRM","ts":<epoch optional>}'})
-    data = request.get_json(silent=True) or {}
-    ts = int(data.get("ts") or time.time())
-    STATE["last_confirm"] = {"ts": ts}
-    dash("signal", "3rd CONFIRM", extra={"ts": ts})
-    return jsonify({"ok": True, "confirm": True, "ts": ts})
-
+    try:
+        _msg, ts = _extract_message_and_ts()
+        STATE["last_confirm"] = {"ts": ts}
+        dash("signal", "3rd CONFIRM", extra={"ts": ts})
+        return jsonify({"ok": True, "confirm": True, "ts": ts}), 200
+    except Exception as e:
+        dash("warn", f"webhook_confirm handler error: {e}")
+        return jsonify({"ok": False, "error": "handler_exception"}), 200
 # ---------------- Force Test Entry ----------------
 @app.route("/test/force_entry", methods=["POST","GET"], strict_slashes=False)
 def test_force_entry():
@@ -698,11 +877,11 @@ def test_force_entry():
     side = str(data.get("side","")).upper()
     trade_pct = _D_safe(data.get("trade_pct"))
     if side not in ("LONG","SHORT"):
-        return jsonify({"ok": False, "reason": "side must be LONG or SHORT"}), 400
+        return jsonify({"ok": False, "reason": "side must be LONG or SHORT"}), 200
     t_pct = trade_pct if trade_pct is not None else TRADE_SIZE_PCT
     dash("state", "FORCE ENTRY invoked", extra={"side": side, "trade_pct": str(t_pct)})
-    oid = place_market_order(side, t_pct)
-    return jsonify({"ok": bool(oid), "order_id": oid})
+    _async(place_market_order, side, t_pct)
+    return jsonify({"ok": True, "queued": True, "side": side, "trade_pct": str(t_pct)}), 200
 
 # ---------------- TP/SL watchdog (explicit close + clean reset) ----------------
 def tp_sl_watchdog():
@@ -718,7 +897,6 @@ def tp_sl_watchdog():
             if not open_:
                 time.sleep(1); continue
 
-            # TP?
             if tp_id:
                 info = _fetch_order(tp_id)
                 if _ord_status(info) in TERMINAL_STATES:
@@ -726,10 +904,9 @@ def tp_sl_watchdog():
                     _full_reset("TP")
                     time.sleep(1); continue
 
-            # SL?
             if sl_id:
                 info = _fetch_order(sl_id)
-                if _ord_status(info) in TERMININAL_STATES:
+                if _ord_status(info) in TERMINAL_STATES:
                     dash("trade", "SL FILLED", extra={"id": sl_id, "side": side, "size": str(size), "entry": str(entry)})
                     _full_reset("SL")
                     time.sleep(1); continue
@@ -738,9 +915,6 @@ def tp_sl_watchdog():
         except Exception as e:
             dash("warn", f"tp_sl_watchdog error: {e}")
             time.sleep(1)
-
-# (typo guard)
-TERMININAL_STATES = TERMINAL_STATES  # alias to avoid accidental misspells above
 
 # ---------------- Health ----------------
 @app.route("/__alive__", methods=["GET"])
@@ -765,10 +939,14 @@ def alive():
         }
     }), 200
 
-@app.route("/")
-def root():
-    # simple root to trigger @before_first_request under gunicorn and for Render health checks
-    return jsonify({"ok": True, "service": APP_NAME, "now_utc10": now()})
+@app.route("/ping", methods=["GET"])
+def ping():
+    return jsonify({"pong": True, "ts": int(time.time()), "now_utc10": now()}), 200
+
+@app.route("/admin/reset_state", methods=["POST","GET"])
+def admin_reset_state():
+    _full_reset("ADMIN")
+    return jsonify({"ok": True, "msg": "state reset"}), 200
 
 # ---------------- Background Threads ----------------
 def bg_bias_loop():
@@ -798,37 +976,38 @@ def bg_monitor_loop():
             dash("warn", f"monitor loop error: {e}")
             time.sleep(2)
 
-_bg_threads_started = False
+_THREADS_STARTED = False
 def start_background_threads_once():
-    global _bg_threads_started
-    if _bg_threads_started:
+    global _THREADS_STARTED
+    if _THREADS_STARTED:
         return
     threading.Thread(target=bg_bias_loop,   name="bias",    daemon=True).start()
     threading.Thread(target=bg_monitor_loop,name="monitor", daemon=True).start()
     threading.Thread(target=tp_sl_watchdog, name="tp_sl",   daemon=True).start()
-    _bg_threads_started = True
-    dash("ok", "Background threads started")
+    _THREADS_STARTED = True
 
-@app.before_first_request
-def _boot_under_gunicorn():
-    # Render/gunicorn path: no __main__ block runs, so boot here on first HTTP request
+def boot_on_import():
+    # Called at module import (so gunicorn workers start processing immediately)
     dash_startup()
+    ping_capital_manager()
     dash_capital_status_once()
     start_background_threads_once()
 
-# ---------------- Runner (local dev) ----------------
+# Boot immediately unless explicitly disabled
+if os.environ.get("DISABLE_BOOT_ON_IMPORT", "0") != "1":
+    boot_on_import()
+
+# ---------------- Local runner (not used on Render) ----------------
 if __name__ == "__main__":
     app.config.update(ENV="production", DEBUG=False)
-    dash_startup()
-    dash_capital_status_once()
-
-    # Creds check
-    missing = [k for k, v in api_creds.items() if not v or v == "REPLACE_ME"]
-    if missing or zk_seeds == "REPLACE_ME" or zk_l2Key == "REPLACE_ME":
-        dash("warn", "Missing ApeX credentials — fill api_creds/zk_seeds/zk_l2Key before trading.")
-
-    start_background_threads_once()
-
     port = int(os.environ.get("PORT", "5008"))
-    dash("ok", f"Serving on 127.0.0.1:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+    dash("ok", f"Serving on 0.0.0.0:{port}")
+    start_background_threads_once()
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False,
+        threaded=True
+    )
+
