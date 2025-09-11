@@ -1,4 +1,5 @@
-# bots/app_sol_v1_4.py — Apex Omni SOL Bot (v1.4) — Render-ready + reliable dash logging
+ bots/app_sol_v1_4.py — Apex Omni SOL Bot (v1.4)
+# Render-ready + reliable dash logging + instant exit on TREND flip
 
 import os
 import sys
@@ -79,8 +80,8 @@ ICT_REQUIRE_BOS    = False
 DEBUG_BIAS         = True
 
 # Trade gates
-USE_BIAS            = False     # trade only with bias
-ALLOW_COUNTER_TREND = True      # allow against bias if True
+USE_BIAS            = False     # set True to gate by bias
+ALLOW_COUNTER_TREND = False      # set False to disallow counter-trend
 
 # Exchange tick/steps (ApeX SOL)
 TICK_SIZE       = Decimal("0.01")
@@ -110,7 +111,7 @@ ENABLE_THIRD_CONFIRMATION = os.environ.get("ENABLE_THIRD_CONFIRMATION", "0") == 
 # Heartbeat logging (prevents “quiet logs look dead”)
 DASH_HEARTBEAT_SEC = int(os.environ.get("DASH_HEARTBEAT_SEC", "60"))
 
-# ---------------- Credentials (env-first; fallback to your current keys) ----------------
+# ---------------- Credentials (env-first; fallback placeholders) ----------------
 api_creds = {
     "key":        os.environ.get("APEX_API_KEY",        "3e965beb-41e2-f125-a7c5-569f45bfba21"),
     "secret":     os.environ.get("APEX_API_SECRET",     "NXtuAyq4hS9G4fVlytQtQGn9Qk5LUukXGAYg8SBj"),
@@ -180,9 +181,6 @@ def ensure_min_notional(size: Decimal, price: Decimal) -> Decimal:
 def fmt_price(x: Decimal) -> str: return fmt_fixed(_D(x), TICK_SIZE)
 def fmt_size(x: Decimal)  -> str: return fmt_fixed(_D(x), SIZE_STEP)
 
-# ---------------- Terminal states ----------------
-TERMINAL_STATES = {"FILLED", "TRIGGERED", "EXECUTED", "COMPLETED", "DONE"}
-
 # ---------------- ApeX circuit breaker ----------------
 API_MAX_TRIES = 4
 API_COOLDOWN_SEC = 30
@@ -203,6 +201,7 @@ def _is_net_err(msg: str) -> bool:
 
 def _apex_backoff_sleep(i: int):
     time.sleep(min(0.5 * (2 ** i), 6.0))
+
 # ---------------- Accounts & Price (with resilient fallbacks) ----------------
 def _binance_ticker_price(symbol_ccxt: str) -> Optional[Decimal]:
     try:
@@ -322,7 +321,6 @@ def dash_bias(new_bias: Optional[str]):
         print(colorize(f"{now()} 🧭 ICT Bias → {human}", color), flush=True)
 
 # ---------------- Bias via Binance (1h) — hardened ----------------
-BISE: Optional[str] = None  # alias kept in sync below
 BIAS: Optional[str] = None
 BIAS_STALE_TTL_SEC = 1800
 _LAST_BIAS_TS = 0
@@ -469,7 +467,6 @@ def compute_bias():
             BIAS = None
             dash_bias(BIAS)
         dash("warn", f"ICT Bias error: {e}")
-
 # ---------------- Capital Manager HTTP helpers ----------------
 def _http_get_json(url: str, timeout: float = 2.0) -> Optional[dict]:
     try:
@@ -543,6 +540,7 @@ POSITION: Dict[str, Any] = {
     "vector_side": None,
 }
 POSITION_LOCK = threading.Lock()
+
 # ---------------- Terminal state helpers ----------------
 def _ord_status(info: dict) -> str:
     return str((info or {}).get("status", "")).upper()
@@ -747,7 +745,6 @@ def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None)
                 capmgr_release(_D(res))
                 POSITION["reserved_margin"] = None
         return None
-
 # ---------------- Latching / Bias gate ----------------
 def _within_window(ts_a: int, ts_b: int) -> bool:
     dt = ts_b - ts_a
@@ -783,6 +780,52 @@ def check_and_latch(desired_side: Optional[str]) -> Optional[str]:
         return None
     return desired_side
 
+# ---------------- Instant exit on TREND flip + re-latch support ----------------
+def close_position_market(reason: str) -> bool:
+    """Instant reduce-only MARKET close of the current position, cancel TP/SL, then clean reset."""
+    try:
+        with POSITION_LOCK:
+            if not POSITION["open"]:
+                return False
+            cur_side = POSITION.get("side")
+            size     = POSITION.get("size")
+            tp_id    = POSITION.get("tp_id")
+            sl_id    = POSITION.get("sl_id")
+
+        # Cancel protection orders first to avoid fills during close
+        if tp_id: _cancel_id(tp_id, "TP")
+        if sl_id: _cancel_id(sl_id, "SL")
+
+        # Reduce-only market close with price hint
+        mark = get_public_price()
+        price_str = fmt_price(floor_to_tick(mark))
+        size_str  = fmt_size(size)
+        opp = "SELL" if cur_side == "LONG" else "BUY"
+
+        resp = client.create_order_v3(
+            symbol=APEX_SYMBOL, side=opp, type="MARKET",
+            size=size_str, price=price_str, reduceOnly=True,
+            timestampSeconds=int(time.time())
+        )
+        dash("trade", f"EXIT MARKET by {reason}",
+             extra={"closed_side": cur_side, "size": size_str, "hint_price": price_str, "resp": (resp.get("data") or {})})
+    except Exception as e:
+        dash("warn", f"close_position_market error: {e}")
+    finally:
+        # Reset local state & notify capital manager
+        _full_reset(reason)
+    return True
+
+def _attempt_latch_after_close(desired_side: str):
+    """Small delay so close completes, then attempt bias/mf window latch for re-entry."""
+    try:
+        time.sleep(0.25)
+        side = check_and_latch(desired_side)
+        if side:
+            place_market_order(side)
+    except Exception as e:
+        dash("warn", f"_attempt_latch_after_close error: {e}")
+
 # ---------------- Webhook helpers ----------------
 def _async(fn, *args, **kwargs):
     threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True).start()
@@ -813,6 +856,7 @@ def parse_up_down(msg: str) -> Optional[str]:
     if "UP" in s: return "UP"
     if "DOWN" in s: return "DOWN"
     return None
+
 # ---------------- Webhooks (async, tolerant, always 200) ----------------
 @app.route("/webhook_mf", methods=["POST","GET"], strict_slashes=False)
 def webhook_mf():
@@ -855,11 +899,27 @@ def webhook_trend():
         else:
             return jsonify({"ok": False, "reason": "message must contain TREND UP or TREND DOWN"}), 200
 
+        # 1) Latch new trend immediately
         STATE["last_trend"] = {"dir": d, "ts": ts}
         dash("signal", f"TREND {d}", extra={"ts": ts, "raw": msg})
 
-        desired = "LONG" if d=="UP" else "SHORT"
-        if not POSITION["open"]:
+        desired = "LONG" if d == "UP" else "SHORT"
+
+        # 2) If live position is opposite → instant market close (cancel TP/SL)
+        with POSITION_LOCK:
+            open_ = POSITION["open"]
+            cur_side = POSITION.get("side")
+
+        if open_ and cur_side and cur_side != desired:
+            dash("state", "TREND flip detected — closing current position now",
+                 extra={"from": cur_side, "to": desired})
+            _async(close_position_market, "TREND_FLIP")
+            # 3) Attempt re-entry if MF is/was within window
+            _async(_attempt_latch_after_close, desired)
+            return jsonify({"ok": True, "flip_exit": True, "to": desired, "ts": ts}), 200
+
+        # If flat (or same direction), normal latch check
+        if not open_:
             side = check_and_latch(desired)
             if side:
                 _async(place_market_order, side)
@@ -882,7 +942,6 @@ def webhook_confirm():
     except Exception as e:
         dash("warn", f"webhook_confirm handler error: {e}")
         return jsonify({"ok": False, "error": "handler_exception"}), 200
-
 # ---------------- TP/SL watchdog (explicit close + clean reset) ----------------
 def tp_sl_watchdog():
     while STATE["running"]:
