@@ -1,4 +1,4 @@
-
+# bots/app_sol_v1_4.py — Apex Omni SOL Bot (v1.5) — Render-ready + hardened logs + cold-start sync
 
 import os
 import sys
@@ -35,7 +35,7 @@ getcontext().prec = 28
 
 # ---------------- App ----------------
 app = Flask(__name__)
-APP_NAME = "Apex Omni SOL Bot (v1.4)"
+APP_NAME = "Apex Omni SOL Bot (v1.5)"
 STARTED_AT_UTC = datetime.utcnow().isoformat() + "Z"
 
 # ---------------- Timezone (UTC+10) ----------------
@@ -79,8 +79,8 @@ ICT_REQUIRE_BOS    = False
 DEBUG_BIAS         = True
 
 # Trade gates
-USE_BIAS            = False     # set True to gate by bias
-ALLOW_COUNTER_TREND = False      # set False to disallow counter-trend
+USE_BIAS            = False     # gate by bias if True
+ALLOW_COUNTER_TREND = True      # allow against bias if True
 
 # Exchange tick/steps (ApeX SOL)
 TICK_SIZE       = Decimal("0.01")
@@ -94,7 +94,7 @@ CAPMGR_URL      = os.environ.get("CAPMGR_URL", "http://127.0.0.1:5015")
 LEVERAGE        = Decimal(os.environ.get("LEVERAGE", "10"))
 TRADE_SIZE_PCT  = Decimal(os.environ.get("TRADE_SIZE_PCT", "0.12"))   # % of allocation per entry
 
-# Bias-aware TP/SL (fractions; 0.002 = 0.2%)
+# Bias-aware TP/SL (fractions; 0.01 = 1%)
 TREND_TP_PCT    = Decimal(os.environ.get("TREND_TP_PCT", "0.02"))
 TREND_SL_PCT    = Decimal(os.environ.get("TREND_SL_PCT", "0.012"))
 CT_TP_PCT       = Decimal(os.environ.get("CT_TP_PCT", "0.010"))
@@ -104,11 +104,13 @@ CT_SL_PCT       = Decimal(os.environ.get("CT_SL_PCT", "0.0075"))
 MF_WAIT_SEC     = int(os.environ.get("MF_WAIT_SEC", "8000"))
 MF_LEAD_SEC     = int(os.environ.get("MF_LEAD_SEC", "8000"))
 
-# Optional 3rd confirmation webhook (provision)
+# Optional 3rd confirmation webhook
 ENABLE_THIRD_CONFIRMATION = os.environ.get("ENABLE_THIRD_CONFIRMATION", "0") == "1"
 
 # Heartbeat logging (prevents “quiet logs look dead”)
-DASH_HEARTBEAT_SEC = int(os.environ.get("DASH_HEARTBEAT_SEC", "60"))
+DASH_HEARTBEAT_SEC = int(os.environ.get("DASH_HEARTBEAT_SEC", "30"))  # tighter default
+# Optional: mirror key logs to your own webhook (set LOG_WEBHOOK env)
+LOG_WEBHOOK = os.environ.get("LOG_WEBHOOK", "").strip()
 
 # ---------------- Credentials (env-first; fallback placeholders) ----------------
 api_creds = {
@@ -201,100 +203,22 @@ def _is_net_err(msg: str) -> bool:
 def _apex_backoff_sleep(i: int):
     time.sleep(min(0.5 * (2 ** i), 6.0))
 
-# ---------------- Accounts & Price (with resilient fallbacks) ----------------
-def _binance_ticker_price(symbol_ccxt: str) -> Optional[Decimal]:
+# ---------------- Dashboard / logging ----------------
+DASH_LAST = {"bias": None, "connected": False}
+_HEARTBEAT_SEQ = 0
+
+def _log_webhook_async(payload: dict):
+    if not LOG_WEBHOOK:
+        return
     try:
-        ex = ccxt.binance({"timeout": 20000, "enableRateLimit": True})
-        t = ex.fetch_ticker(symbol_ccxt)
-        for k in ("info", "last", "close"):
-            v = t.get(k)
-            if v is None: continue
-            try:
-                return _D_safe(v) if k == "info" else _D(v)
-            except Exception:
-                continue
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(LOG_WEBHOOK, data=data, headers={"Content-Type":"application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=1.8)  # fire-and-forget-ish
     except Exception:
         pass
-    return None
-
-def get_public_price() -> Decimal:
-    """
-    Prefer markPrice → indexPrice → lastPrice from ApeX; fallback to Binance last/close.
-    Always return > 0 or raise.
-    """
-    try:
-        t = http_public.ticker_v3(symbol=APEX_SYMBOL)
-        row = (t.get("data") or [{}])[0]
-        for key in ("markPrice","indexPrice","lastPrice"):
-            v = _D_safe(row.get(key))
-            if v is not None and v > 0:
-                return v
-    except Exception as e:
-        dash("warn", f"http_public.ticker_v3 error: {e}")
-
-    # Fallback: Binance
-    vb = _binance_ticker_price(BINANCE_SYMBOL)
-    if vb and vb > 0:
-        dash("state", "Price fallback used (Binance)")
-        return vb
-
-    raise ValueError("No valid mark/index/last price (ApeX) and Binance fallback failed")
-
-def get_usdt_contract_balance() -> Decimal:
-    try:
-        if _apex_circuit_open():
-            raise RuntimeError("APEX circuit open; skipping account read temporarily")
-        last_err = None
-        for i in range(API_MAX_TRIES):
-            try:
-                acct = client.get_account_v3()
-                for w in acct.get("contractWallets", []):
-                    if w.get("token") == "USDT":
-                        return Decimal(str(w.get("balance", "0")))
-                return Decimal("0")
-            except Exception as e:
-                last_err = e
-                msg = str(e)
-                dash("warn", f"get_usdt_contract_balance error: {msg}")
-                if _is_net_err(msg):
-                    _apex_backoff_sleep(i); continue
-                break
-        _note_apex_failure()
-        if last_err: raise last_err
-    except Exception as e:
-        dash("warn", f"get_usdt_contract_balance final error: {e}")
-    return Decimal("0")
-
-def get_open_position() -> Optional[dict]:
-    try:
-        if _apex_circuit_open():
-            raise RuntimeError("APEX circuit open; skipping get_open_position temporarily")
-        last_err = None
-        for i in range(API_MAX_TRIES):
-            try:
-                acct = client.get_account_v3()
-                for p in acct.get("positions", []):
-                    if p.get("symbol") == APEX_SYMBOL and Decimal(str(p.get("size", "0"))) != Decimal("0"):
-                        return p
-                return None
-            except Exception as e:
-                last_err = e
-                msg = str(e)
-                dash("warn", f"get_open_position error: {msg}")
-                if _is_net_err(msg):
-                    _apex_backoff_sleep(i); continue
-                break
-        _note_apex_failure()
-        if last_err: raise last_err
-    except Exception as e:
-        dash("warn", f"get_open_position final error: {e}")
-    return None
-
-# ---------------- Dashboard ----------------
-DASH_LAST = {"bias": None, "connected": False}
 
 def dash(event: str, msg: str, *, extra: Optional[dict] = None):
-    """Console dashboard printer (flushed for Render)."""
+    """Console dashboard printer (flushed for Render) + optional webhook mirror."""
     icons = {"start":"🚀","ok":"✅","warn":"⚠️","error":"❌","signal":"🔔","state":"🖥️","trade":"📈","debug":"🔎"}
     colors = {"start":"cyan","ok":"green","warn":"yellow","error":"red","signal":"mag","state":"blue","trade":"green","debug":"gray"}
     icon = icons.get(event, "•"); col = colors.get(event, "reset")
@@ -302,7 +226,10 @@ def dash(event: str, msg: str, *, extra: Optional[dict] = None):
     if extra:
         dim_l = CLR['dim']; dim_r = CLR['reset'] if CLR['dim'] else ""
         payload += f" {dim_l}{extra}{dim_r}" if dim_l else f" {extra}"
-    print(colorize(payload, col), flush=True)  # <-- critical: flush
+    print(colorize(payload, col), flush=True)
+    # mirror key events (avoid spamming 'debug')
+    if event in ("start","ok","warn","error","signal","state","trade"):
+        _async(_log_webhook_async, {"ts": int(time.time()), "event": event, "msg": msg, "extra": extra})
 
 def dash_startup():
     if not DASH_LAST["connected"]:
@@ -318,7 +245,6 @@ def dash_bias(new_bias: Optional[str]):
         human = new_bias if new_bias else "NEUTRAL"
         color = "green" if new_bias == "LONG" else "red" if new_bias == "SHORT" else "yellow"
         print(colorize(f"{now()} 🧭 ICT Bias → {human}", color), flush=True)
-
 # ---------------- Bias via Binance (1h) — hardened ----------------
 BIAS: Optional[str] = None
 BIAS_STALE_TTL_SEC = 1800
@@ -466,6 +392,7 @@ def compute_bias():
             BIAS = None
             dash_bias(BIAS)
         dash("warn", f"ICT Bias error: {e}")
+
 # ---------------- Capital Manager HTTP helpers ----------------
 def _http_get_json(url: str, timeout: float = 2.0) -> Optional[dict]:
     try:
@@ -522,7 +449,6 @@ def capmgr_release(amount_usdt: Decimal) -> Optional[dict]:
 
 def capmgr_on_close() -> Optional[dict]:
     return _http_post_json(f"{CAPMGR_URL}/on_close", {"bot_id": BOT_ID})
-
 # ---------------- Runtime State ----------------
 STATE: Dict[str, Any] = {
     "running": True,
@@ -541,6 +467,8 @@ POSITION: Dict[str, Any] = {
 POSITION_LOCK = threading.Lock()
 
 # ---------------- Terminal state helpers ----------------
+TERMINAL_STATES = {"FILLED", "TRIGGERED", "EXECUTED", "COMPLETED", "DONE"}
+
 def _ord_status(info: dict) -> str:
     return str((info or {}).get("status", "")).upper()
 
@@ -744,6 +672,7 @@ def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None)
                 capmgr_release(_D(res))
                 POSITION["reserved_margin"] = None
         return None
+
 # ---------------- Latching / Bias gate ----------------
 def _within_window(ts_a: int, ts_b: int) -> bool:
     dt = ts_b - ts_a
@@ -977,6 +906,8 @@ def tp_sl_watchdog():
 # ---------------- Health ----------------
 @app.route("/__alive__", methods=["GET"])
 def alive():
+    global _HEARTBEAT_SEQ
+    _HEARTBEAT_SEQ += 1
     return jsonify({
         "ok": True,
         "app": APP_NAME,
@@ -984,6 +915,7 @@ def alive():
         "now_utc10": now(),
         "bias": BIAS,
         "use_bias": USE_BIAS,
+        "heartbeat_seq": _HEARTBEAT_SEQ,
         "mf_last": STATE["last_mf"],
         "trend_last": STATE["last_trend"],
         "mf_flip_since_entry": STATE["mf_flip_since_entry"],
@@ -997,14 +929,111 @@ def alive():
         }
     }), 200
 
+@app.route("/__threads__", methods=["GET"])
+def threads():
+    items = []
+    for t in threading.enumerate():
+        items.append({"name": t.name, "daemon": t.daemon, "alive": t.is_alive()})
+    return jsonify({"ok": True, "threads": items, "count": len(items)}), 200
+
 @app.route("/ping", methods=["GET"])
 def ping():
+    dash("state", "ping endpoint hit")
     return jsonify({"pong": True, "ts": int(time.time()), "now_utc10": now()}), 200
 
 @app.route("/admin/reset_state", methods=["POST","GET"])
 def admin_reset_state():
     _full_reset("ADMIN")
     return jsonify({"ok": True, "msg": "state reset"}), 200
+
+# ---------------- Accounts & Price (with resilient fallbacks) ----------------
+def _binance_ticker_price(symbol_ccxt: str) -> Optional[Decimal]:
+    try:
+        ex = ccxt.binance({"timeout": 20000, "enableRateLimit": True})
+        t = ex.fetch_ticker(symbol_ccxt)
+        for k in ("info", "last", "close"):
+            v = t.get(k)
+            if v is None: continue
+            try:
+                return _D_safe(v) if k == "info" else _D(v)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+def get_public_price() -> Decimal:
+    """
+    Prefer markPrice → indexPrice → lastPrice from ApeX; fallback to Binance last/close.
+    Always return > 0 or raise.
+    """
+    try:
+        t = http_public.ticker_v3(symbol=APEX_SYMBOL)
+        row = (t.get("data") or [{}])[0]
+        for key in ("markPrice","indexPrice","lastPrice"):
+            v = _D_safe(row.get(key))
+            if v is not None and v > 0:
+                return v
+    except Exception as e:
+        dash("warn", f"http_public.ticker_v3 error: {e}")
+
+    # Fallback: Binance
+    vb = _binance_ticker_price(BINANCE_SYMBOL)
+    if vb and vb > 0:
+        dash("state", "Price fallback used (Binance)")
+        return vb
+
+    raise ValueError("No valid mark/index/last price (ApeX) and Binance fallback failed")
+
+def get_usdt_contract_balance() -> Decimal:
+    try:
+        if _apex_circuit_open():
+            raise RuntimeError("APEX circuit open; skipping account read temporarily")
+        last_err = None
+        for i in range(API_MAX_TRIES):
+            try:
+                acct = client.get_account_v3()
+                for w in acct.get("contractWallets", []):
+                    if w.get("token") == "USDT":
+                        return Decimal(str(w.get("balance", "0")))
+                return Decimal("0")
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                dash("warn", f"get_usdt_contract_balance error: {msg}")
+                if _is_net_err(msg):
+                    _apex_backoff_sleep(i); continue
+                break
+        _note_apex_failure()
+        if last_err: raise last_err
+    except Exception as e:
+        dash("warn", f"get_usdt_contract_balance final error: {e}")
+    return Decimal("0")
+
+def get_open_position() -> Optional[dict]:
+    try:
+        if _apex_circuit_open():
+            raise RuntimeError("APEX circuit open; skipping get_open_position temporarily")
+        last_err = None
+        for i in range(API_MAX_TRIES):
+            try:
+                acct = client.get_account_v3()
+                for p in acct.get("positions", []):
+                    if p.get("symbol") == APEX_SYMBOL and Decimal(str(p.get("size", "0"))) != Decimal("0"):
+                        return p
+                return None
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                dash("warn", f"get_open_position error: {msg}")
+                if _is_net_err(msg):
+                    _apex_backoff_sleep(i); continue
+                break
+        _note_apex_failure()
+        if last_err: raise last_err
+    except Exception as e:
+        dash("warn", f"get_open_position final error: {e}")
+    return None
 
 # ---------------- Background Threads ----------------
 def bg_bias_loop():
@@ -1058,6 +1087,27 @@ def bg_heartbeat_loop():
             dash("warn", f"heartbeat error: {e}")
             time.sleep(10)
 
+def cold_start_sync_position():
+    """On boot, detect and report any live exchange position so you aren’t blind after restarts."""
+    try:
+        pos = get_open_position()
+        if not pos:
+            dash("ok", "Cold-start: exchange shows FLAT")
+            return
+        size_raw = _D_safe(pos.get("size", "0")) or Decimal("0")
+        side = "LONG" if size_raw > 0 else "SHORT"
+        size = size_raw.copy_abs()
+        entry = _D_safe(pos.get("entryPrice") or pos.get("avgEntryPrice") or pos.get("averagePrice"))
+        with POSITION_LOCK:
+            POSITION.update({
+                "open": True, "side": side, "size": size, "entry": entry,
+                "order_id": None, "tp_id": None, "sl_id": None, "tp": None, "sl": None,
+                "margin": None, "reserved_margin": None, "vector_close_timestamp": None, "vector_side": None
+            })
+        dash("state", "Cold-start: detected live position", extra={"side": side, "size": str(size), "entry": str(entry)})
+    except Exception as e:
+        dash("warn", f"cold_start_sync_position error: {e}")
+
 _THREADS_STARTED = False
 def start_background_threads_once():
     global _THREADS_STARTED
@@ -1076,6 +1126,10 @@ def boot_on_import():
     dash("state", "Pinging Capital Manager…", extra={"url": CAPMGR_URL})
     ping_capital_manager()
     dash_capital_status_once()
+
+    # Cold-start sync BEFORE starting loops so the very first heartbeat reflects reality
+    cold_start_sync_position()
+
     start_background_threads_once()
 
 # Boot immediately unless explicitly disabled
@@ -1095,3 +1149,4 @@ if __name__ == "__main__":
         use_reloader=False,
         threaded=True
     )
+
