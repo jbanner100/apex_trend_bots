@@ -1,3 +1,4 @@
+# bots/app_btc_v1_6.py
 import os
 import sys
 import json
@@ -14,6 +15,7 @@ from flask import Flask, request, jsonify
 # stdlib HTTP (no external "requests" dep)
 import urllib.request
 import urllib.error
+import gc
 
 # === ApeX API imports ===
 from apexomni.constants import APEX_OMNI_HTTP_MAIN, NETWORKID_OMNI_MAIN_ARB
@@ -27,12 +29,15 @@ try:
 except Exception:
     pass
 
+# also force prints to flush on each call
+print = lambda *a, **k: (__import__("builtins").print)(*a, **{**k, "flush": True})
+
 # ---------------- Precision ----------------
 getcontext().prec = 28
 
 # ---------------- App ----------------
 app = Flask(__name__)
-APP_NAME = "Apex Omni BTC Bot (v1.5)"
+APP_NAME = "Apex Omni BTC Bot (v1.6)"
 STARTED_AT_UTC = datetime.utcnow().isoformat() + "Z"
 
 # ---------------- Timezone (UTC+10) ----------------
@@ -105,11 +110,13 @@ MF_LEAD_SEC     = int(os.environ.get("MF_LEAD_SEC", "8000"))
 ENABLE_THIRD_CONFIRMATION = os.environ.get("ENABLE_THIRD_CONFIRMATION", "0") == "1"
 
 # Heartbeat logging (prevents “quiet logs look dead”)
-# v1.5 default tighter (30s) for BTC
 DASH_HEARTBEAT_SEC = int(os.environ.get("DASH_HEARTBEAT_SEC", "30"))
 
 # External log mirroring (optional)
-LOG_WEBHOOK = os.environ.get("LOG_WEBHOOK")  # POST JSON here if set
+LOG_WEBHOOK = os.environ.get("LOG_WEBHOOK")  # POST JSON to this URL if set
+
+# Bias loop cadence (tunable to reduce memory/CPU)
+BIAS_LOOP_SEC = int(os.environ.get("BIAS_LOOP_SEC", "60"))
 
 # ---------------- Credentials (env-first; fallback to your current keys) ----------------
 api_creds = {
@@ -182,7 +189,10 @@ def fmt_price(x: Decimal) -> str: return fmt_fixed(_D(x), TICK_SIZE)
 def fmt_size(x: Decimal)  -> str: return fmt_fixed(_D(x), SIZE_STEP)
 
 # ---------------- Terminal states ----------------
-TERMINAL_STATES = {"FILLED", "TRIGGERED", "EXECUTED", "COMPLETED", "DONE"}
+TERMINAL_STATES = {
+    "FILLED", "TRIGGERED", "EXECUTED", "COMPLETED", "DONE",
+    "CANCELED", "CANCELLED"
+}
 
 # ---------------- ApeX circuit breaker ----------------
 API_MAX_TRIES = 4
@@ -197,22 +207,13 @@ def _note_apex_failure():
     if _APEX_CB["failures"] >= API_MAX_TRIES:
         _APEX_CB["open_until"] = time.time() + API_COOLDOWN_SEC
         _APEX_CB["failures"] = 0
-
-def _is_net_err(msg: str) -> bool:
-    m = msg.lower()
-    return any(k in m for k in ["timeout", "timed out", "dns", "name or service", "temporary failure", "max retries"])
-
-def _apex_backoff_sleep(i: int):
-    time.sleep(min(0.5 * (2 ** i), 6.0))
-
 # ---------------- External log mirroring helpers ----------------
 def _post_json_quick(url: str, payload: dict, timeout: float = 1.2):
     try:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type":"application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            # fire-and-forget; don’t block on reading body
-            _ = r.read(0)
+            _ = r.read(0)  # fire-and-forget
     except Exception:
         pass
 
@@ -231,6 +232,38 @@ def _mirror_to_webhook(event: str, msg: str, extra: Optional[dict]):
     }
     _async(_post_json_quick, LOG_WEBHOOK, payload)
 
+# ---------------- Dashboard ----------------
+DASH_LAST = {"bias": None, "connected": False}
+HEARTBEAT_SEQ = 0
+LAST_HEARTBEAT_TS = 0
+
+def dash(event: str, msg: str, *, extra: Optional[dict] = None):
+    icons = {"start":"🚀","ok":"✅","warn":"⚠️","error":"❌","signal":"🔔","state":"🖥️","trade":"📈","debug":"🔎"}
+    colors = {"start":"cyan","ok":"green","warn":"yellow","error":"red","signal":"mag","state":"blue","trade":"green","debug":"gray"}
+    icon = icons.get(event, "•"); col = colors.get(event, "reset")
+    payload = f"{now()} {icon} {msg}"
+    if extra:
+        dim_l = CLR['dim']; dim_r = CLR['reset'] if CLR['dim'] else ""
+        payload += f" {dim_l}{extra}{dim_r}" if dim_l else f" {extra}"
+    print(colorize(payload, col))
+    _mirror_to_webhook(event, msg, extra)
+
+def dash_startup():
+    if not DASH_LAST["connected"]:
+        DASH_LAST["connected"] = True
+        dash("start", f"{APP_NAME} starting")
+        dash("ok", "ApeX client initialized", extra={"endpoint": APEX_OMNI_HTTP_MAIN})
+        dash("state", f"USE_BIAS={USE_BIAS}, ALLOW_COUNTER_TREND={ALLOW_COUNTER_TREND}")
+        dash("state", "Waiting for signals: MF + TREND", extra={"lead_sec": MF_LEAD_SEC, "wait_sec": MF_WAIT_SEC})
+
+def dash_bias(new_bias: Optional[str]):
+    if DASH_LAST["bias"] != new_bias:
+        DASH_LAST["bias"] = new_bias
+        human = new_bias if new_bias else "NEUTRAL"
+        color = "green" if new_bias == "LONG" else "red" if new_bias == "SHORT" else "yellow"
+        print(colorize(f"{now()} 🧭 ICT Bias → {human}", color))
+        _mirror_to_webhook("state", f"ICT Bias → {human}", {"bias": new_bias})
+
 # ---------------- Accounts & Price (with resilient fallbacks) ----------------
 def get_usdt_contract_balance() -> Decimal:
     try:
@@ -248,8 +281,8 @@ def get_usdt_contract_balance() -> Decimal:
                 last_err = e
                 msg = str(e)
                 dash("warn", f"get_usdt_contract_balance error: {msg}")
-                if _is_net_err(msg):
-                    _apex_backoff_sleep(i); continue
+                if any(k in msg.lower() for k in ["timeout","timed out","dns","name or service","temporary failure","max retries"]):
+                    time.sleep(min(0.5 * (2 ** i), 6.0)); continue
                 break
         _note_apex_failure()
         if last_err: raise last_err
@@ -273,8 +306,8 @@ def get_open_position() -> Optional[dict]:
                 last_err = e
                 msg = str(e)
                 dash("warn", f"get_open_position error: {msg}")
-                if _is_net_err(msg):
-                    _apex_backoff_sleep(i); continue
+                if any(k in msg.lower() for k in ["timeout","timed out","dns","name or service","temporary failure","max retries"]):
+                    time.sleep(min(0.5 * (2 ** i), 6.0)); continue
                 break
         _note_apex_failure()
         if last_err: raise last_err
@@ -298,10 +331,6 @@ def _binance_ticker_price(symbol_ccxt: str) -> Optional[Decimal]:
     return None
 
 def get_public_price() -> Decimal:
-    """
-    Prefer markPrice → indexPrice → lastPrice from ApeX; fallback to Binance last/close.
-    Always return > 0 or raise.
-    """
     try:
         t = http_public.ticker_v3(symbol=APEX_SYMBOL)
         row = (t.get("data") or [{}])[0]
@@ -319,39 +348,7 @@ def get_public_price() -> Decimal:
 
     raise ValueError("No valid mark/index/last price (ApeX) and Binance fallback failed")
 
-# ---------------- Dashboard ----------------
-DASH_LAST = {"bias": None, "connected": False}
-HEARTBEAT_SEQ = 0  # monotonic
-
-def dash(event: str, msg: str, *, extra: Optional[dict] = None):
-    """Console dashboard printer (flushed for Render) + optional webhook mirror."""
-    icons = {"start":"🚀","ok":"✅","warn":"⚠️","error":"❌","signal":"🔔","state":"🖥️","trade":"📈","debug":"🔎"}
-    colors = {"start":"cyan","ok":"green","warn":"yellow","error":"red","signal":"mag","state":"blue","trade":"green","debug":"gray"}
-    icon = icons.get(event, "•"); col = colors.get(event, "reset")
-    payload = f"{now()} {icon} {msg}"
-    if extra:
-        dim_l = CLR['dim']; dim_r = CLR['reset'] if CLR['dim'] else ""
-        payload += f" {dim_l}{extra}{dim_r}" if dim_l else f" {extra}"
-    print(colorize(payload, col), flush=True)
-    # mirror to external webhook (best-effort, non-blocking)
-    _mirror_to_webhook(event, msg, extra)
-
-def dash_startup():
-    if not DASH_LAST["connected"]:
-        DASH_LAST["connected"] = True
-        dash("start", f"{APP_NAME} starting")
-        dash("ok", "ApeX client initialized", extra={"endpoint": APEX_OMNI_HTTP_MAIN})
-        dash("state", f"USE_BIAS={USE_BIAS}, ALLOW_COUNTER_TREND={ALLOW_COUNTER_TREND}")
-        dash("state", "Waiting for signals: MF + TREND", extra={"lead_sec": MF_LEAD_SEC, "wait_sec": MF_WAIT_SEC})
-
-def dash_bias(new_bias: Optional[str]):
-    if DASH_LAST["bias"] != new_bias:
-        DASH_LAST["bias"] = new_bias
-        human = new_bias if new_bias else "NEUTRAL"
-        color = "green" if new_bias == "LONG" else "red" if new_bias == "SHORT" else "yellow"
-        print(colorize(f"{now()} 🧭 ICT Bias → {human}", color), flush=True)
-        _mirror_to_webhook("state", f"ICT Bias → {human}", {"bias": new_bias})
-# ---------------- Bias via Binance (1h) — hardened ----------------
+# ---------------- Bias via Binance (1h) — hardened & memory-friendly ----------------
 BIAS: Optional[str] = None
 BIAS_STALE_TTL_SEC = 1800
 _LAST_BIAS_TS = 0
@@ -382,7 +379,8 @@ def _rotate_binance_host():
     _BINANCE_IDX = (_BINANCE_IDX + 1) % len(BINANCE_HOSTS)
     _BINANCE = None
 
-def fetch_binance_candles(symbol: str, interval: str, limit: int = 500) -> Optional[pd.DataFrame]:
+def fetch_binance_candles(symbol: str, interval: str, limit: int = 400) -> Optional[pd.DataFrame]:
+    # limit trimmed for memory; still enough for EMA + swing logic
     backoff = 0.4
     for attempt in range(5):
         try:
@@ -399,7 +397,7 @@ def fetch_binance_candles(symbol: str, interval: str, limit: int = 500) -> Optio
         except Exception as e:
             err = str(e)
             dash("warn", f"fetch_binance_candles error: {err}")
-            if any(k in err.lower() for k in ["timeout", "timed out", "temporary failure", "name or service", "dns", "exchangeinfo", "429"]):
+            if any(k in err.lower() for k in ["timeout","timed out","temporary failure","name or service","dns","exchangeinfo","429"]):
                 if attempt < 4:
                     _rotate_binance_host()
                     time.sleep(backoff)
@@ -466,7 +464,7 @@ def compute_bias():
     """Hardened bias updater with sticky fallback."""
     global BIAS, _LAST_BIAS_TS
     try:
-        limit = max(EMA_PERIOD + 200, 300)
+        limit = max(EMA_PERIOD + 120, 250)
         df = fetch_binance_candles(BINANCE_SYMBOL, BIAS_INTERVAL, limit=limit)
         if df is None or df.empty or len(df) < EMA_PERIOD + ICT_EMA_SLOPE_BARS + 10:
             age = int(time.time()) - _LAST_BIAS_TS
@@ -482,6 +480,9 @@ def compute_bias():
             return
 
         decided = compute_ict_bias_from_candles(df)
+        del df  # free memory
+        gc.collect()
+
         if decided != BIAS:
             BIAS = decided
             dash_bias(BIAS)
@@ -547,15 +548,6 @@ def dash_capital_status_once():
         })
     dash("ok", "Capital Manager status", extra=extra)
 
-def capmgr_reserve(trade_pct: Decimal) -> Optional[dict]:
-    return _http_post_json(f"{CAPMGR_URL}/reserve", {"bot_id": BOT_ID, "trade_pct": str(trade_pct)})
-
-def capmgr_release(amount_usdt: Decimal) -> Optional[dict]:
-    return _http_post_json(f"{CAPMGR_URL}/release", {"bot_id": BOT_ID, "amount_usdt": str(amount_usdt)})
-
-def capmgr_on_close() -> Optional[dict]:
-    return _http_post_json(f"{CAPMGR_URL}/on_close", {"bot_id": BOT_ID})
-
 # ---------------- Runtime State ----------------
 STATE: Dict[str, Any] = {
     "running": True,
@@ -584,17 +576,14 @@ def _normalize_apex_side(raw: Optional[str]) -> Optional[str]:
     return None
 
 def _extract_entry_price_from_position(p: dict) -> Optional[Decimal]:
-    # try multiple common fields; fall back to None
-    candidates = [
+    for k in [
         "avgEntryPrice", "entryPrice", "averageEntryPrice", "avgPrice",
         "openPrice", "averageOpenPrice", "fillPrice", "lastPrice", "markPrice",
-    ]
-    for k in candidates:
+    ]:
         v = _D_safe(p.get(k))
         if v and v > 0:
             return v
     return None
-
 # ---------------- Terminal state helpers ----------------
 def _ord_status(info: dict) -> str:
     return str((info or {}).get("status", "")).upper()
@@ -612,8 +601,8 @@ def _fetch_order(order_id: str) -> dict:
                 last_err = e
                 msg = str(e)
                 dash("warn", "get_order_v3 error", extra={"id": order_id, "err": msg})
-                if _is_net_err(msg):
-                    _apex_backoff_sleep(i); continue
+                if any(k in msg.lower() for k in ["timeout","timed out","dns","name or service","temporary failure","max retries"]):
+                    time.sleep(min(0.5 * (2 ** i), 6.0)); continue
                 break
         _note_apex_failure()
         if last_err: raise last_err
@@ -675,6 +664,7 @@ def tp_price_from(entry: Decimal, side: str, pct: Decimal) -> Decimal:
 def sl_price_from(entry: Decimal, side: str, pct: Decimal) -> Decimal:
     entry = _D(entry); pct = _D(pct)
     return entry * (Decimal("1")-pct) if side=="LONG" else entry * (Decimal("1")+pct)
+
 # ---------------- MARKET Entry (+ reduce-only TP/SL) ----------------
 def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None) -> Optional[str]:
     try:
@@ -683,7 +673,7 @@ def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None)
             dash("error", f"Invalid direction: {direction}")
             return None
 
-        # Live position gate (fresh read)
+        # Double-check live position gate
         live = get_open_position()
         if live:
             dash("warn", "Live position exists — aborting duplicate order.",
@@ -708,7 +698,7 @@ def place_market_order(direction: str, trade_size_pct: Optional[Decimal] = None)
             dash("warn", "No capital available for this entry", extra={"trade_pct": str(t_pct)})
             return None
 
-        # Price & rounding (MARKET with price hint)
+        # Price & rounding
         mark_price = get_public_price()
         mark_price_r = floor_to_tick(mark_price)  # BTC tick=1
         price_str   = fmt_price(mark_price_r)
@@ -846,11 +836,9 @@ def close_position_market(reason: str) -> bool:
             tp_id    = POSITION.get("tp_id")
             sl_id    = POSITION.get("sl_id")
 
-        # Cancel protection orders first to avoid fills during close
         if tp_id: _cancel_id(tp_id, "TP")
         if sl_id: _cancel_id(sl_id, "SL")
 
-        # Reduce-only market close with price hint
         mark = get_public_price()
         price_str = fmt_price(floor_to_tick(mark))
         size_str  = fmt_size(size)
@@ -866,12 +854,10 @@ def close_position_market(reason: str) -> bool:
     except Exception as e:
         dash("warn", f"close_position_market error: {e}")
     finally:
-        # Reset local state & notify capital manager
         _full_reset(reason)
     return True
 
 def _attempt_latch_after_close(desired_side: str):
-    """Small delay so close completes, then attempt bias/mf window latch for re-entry."""
     try:
         time.sleep(0.25)
         side = check_and_latch(desired_side)
@@ -879,6 +865,39 @@ def _attempt_latch_after_close(desired_side: str):
             place_market_order(side)
     except Exception as e:
         dash("warn", f"_attempt_latch_after_close error: {e}")
+
+# ---------------- Reconciliation (fixes missed TP/SL and cold start drift) ----------------
+def _extract_pos_fields(p: dict):
+    side = _normalize_apex_side(p.get("side"))
+    size = _D_safe(p.get("size"))
+    entry = _extract_entry_price_from_position(p)
+    return side, size, entry
+
+def reconcile_with_exchange():
+    """If exchange says FLAT → hard reset. If exchange has a live pos → rehydrate local POSITION."""
+    try:
+        pos = get_open_position()
+        if pos:
+            side, size, entry = _extract_pos_fields(pos)
+            if size and size > 0:
+                with POSITION_LOCK:
+                    was_open = POSITION["open"]
+                    POSITION["open"] = True
+                    if side:  POSITION["side"]  = side
+                    if size:  POSITION["size"]  = size
+                    if entry: POSITION["entry"] = entry
+                if not was_open:
+                    dash("state", "Rehydrated live position from exchange",
+                         extra={"side": POSITION.get("side"), "size": str(POSITION.get("size")), "entry": str(POSITION.get("entry"))})
+                return
+        # Exchange flat:
+        with POSITION_LOCK:
+            was_open = POSITION["open"]
+        if was_open:
+            dash("trade", "Exchange flat detected — syncing local state")
+            _full_reset("EXCHANGE_FLAT")
+    except Exception as e:
+        dash("warn", f"reconcile_with_exchange error: {e}")
 
 # ---------------- Webhook helpers ----------------
 def _extract_message_and_ts():
@@ -950,13 +969,11 @@ def webhook_trend():
         else:
             return jsonify({"ok": False, "reason": "message must contain TREND UP or TREND DOWN"}), 200
 
-        # 1) Latch new trend immediately
         STATE["last_trend"] = {"dir": d, "ts": ts}
         dash("signal", f"TREND {d}", extra={"ts": ts, "raw": msg})
 
         desired = "LONG" if d == "UP" else "SHORT"
 
-        # 2) If live position is opposite → instant market close (cancel TP/SL)
         with POSITION_LOCK:
             open_ = POSITION["open"]
             cur_side = POSITION.get("side")
@@ -965,11 +982,9 @@ def webhook_trend():
             dash("state", "TREND flip detected — closing current position now",
                  extra={"from": cur_side, "to": desired})
             _async(close_position_market, "TREND_FLIP")
-            # 3) Attempt re-entry if MF is/was within window
             _async(_attempt_latch_after_close, desired)
             return jsonify({"ok": True, "flip_exit": True, "to": desired, "ts": ts}), 200
 
-        # If flat (or same direction), normal latch check
         if not open_:
             side = check_and_latch(desired)
             if side:
@@ -1025,23 +1040,135 @@ def tp_sl_watchdog():
             if tp_id:
                 info = _fetch_order(tp_id)
                 if _ord_status(info) in TERMINAL_STATES:
-                    dash("trade", "TP FILLED", extra={"id": tp_id, "side": side, "size": str(size), "entry": str(entry)})
+                    dash("trade", "TP TERMINAL", extra={"id": tp_id, "side": side, "size": str(size), "entry": str(entry)})
                     _full_reset("TP")
                     time.sleep(1); continue
 
             if sl_id:
                 info = _fetch_order(sl_id)
                 if _ord_status(info) in TERMINAL_STATES:
-                    dash("trade", "SL FILLED", extra={"id": sl_id, "side": side, "size": str(size), "entry": str(entry)})
+                    dash("trade", "SL TERMINAL", extra={"id": sl_id, "side": side, "size": str(size), "entry": str(entry)})
                     _full_reset("SL")
                     time.sleep(1); continue
+
+            # If orders didn't show terminal but the account is flat → reset
+            if not get_open_position():
+                with POSITION_LOCK:
+                    if POSITION["open"]:
+                        dash("trade", "Position closed on exchange (no live pos) — resetting")
+                        _full_reset("EXCHANGE_FLAT")
 
             time.sleep(1)
         except Exception as e:
             dash("warn", f"tp_sl_watchdog error: {e}")
             time.sleep(1)
 
-# ---------------- Health ----------------
+# ---------------- Background Threads ----------------
+def bg_bias_loop():
+    dash_startup()
+    while STATE["running"]:
+        try:
+            compute_bias()
+        except Exception as e:
+            dash("warn", f"bias loop error: {e}")
+        time.sleep(max(15, BIAS_LOOP_SEC))
+
+def bg_monitor_loop():
+    last_open = None
+    while STATE["running"]:
+        try:
+            pos = get_open_position()
+            is_open = bool(pos)
+            if is_open != last_open:
+                last_open = is_open
+                if is_open:
+                    dash("state", "Exchange shows a live position",
+                         extra={"size": pos.get("size"), "side": pos.get("side")})
+                else:
+                    dash("state", "Exchange shows FLAT")
+            time.sleep(5)
+        except Exception as e:
+            dash("warn", f"monitor loop error: {e}")
+            time.sleep(2)
+
+def position_guard_loop():
+    """Authoritative reconciliation loop so local state never drifts from exchange."""
+    while STATE["running"]:
+        try:
+            reconcile_with_exchange()
+        except Exception as e:
+            dash("warn", f"position_guard_loop error: {e}")
+        time.sleep(3)
+
+def bg_heartbeat_loop():
+    global HEARTBEAT_SEQ, LAST_HEARTBEAT_TS
+    while STATE["running"]:
+        try:
+            with POSITION_LOCK:
+                pos_snapshot = {
+                    "open": POSITION["open"],
+                    "side": POSITION["side"],
+                    "size": str(POSITION["size"]) if POSITION["size"] else None,
+                    "entry": str(POSITION["entry"]) if POSITION["entry"] else None,
+                    "tp": str(POSITION["tp"]) if POSITION["tp"] else None,
+                    "sl": str(POSITION["sl"]) if POSITION["sl"] else None,
+                }
+            HEARTBEAT_SEQ += 1
+            LAST_HEARTBEAT_TS = int(time.time())
+            dash("state", "heartbeat", extra={
+                "hb_seq": HEARTBEAT_SEQ,
+                "bias": BIAS,
+                "mf_last": STATE["last_mf"],
+                "trend_last": STATE["last_trend"],
+                "position": pos_snapshot
+            })
+            time.sleep(max(10, DASH_HEARTBEAT_SEC))
+        except Exception as e:
+            dash("warn", f"heartbeat error: {e}")
+            time.sleep(10)
+
+_THREADS_STARTED = False
+def start_background_threads_once():
+    global _THREADS_STARTED
+    if _THREADS_STARTED:
+        return
+    threading.Thread(target=bg_bias_loop,        name="bias",        daemon=True).start()
+    threading.Thread(target=bg_monitor_loop,     name="monitor",     daemon=True).start()
+    threading.Thread(target=tp_sl_watchdog,      name="tp_sl",       daemon=True).start()
+    threading.Thread(target=position_guard_loop, name="pos_guard",   daemon=True).start()
+    threading.Thread(target=bg_heartbeat_loop,   name="heartbeat",   daemon=True).start()
+    _THREADS_STARTED = True
+
+# ---------------- Cold-start sync ----------------
+def cold_start_sync_position():
+    """On boot, read exchange position and sync local POSITION for accurate logging/state."""
+    try:
+        pos = get_open_position()
+        if not pos:
+            dash("state", "Cold-start: exchange shows FLAT")
+            return
+        size = _D_safe(pos.get("size")) or Decimal("0")
+        if size == 0:
+            dash("state", "Cold-start: exchange position size=0 → FLAT")
+            return
+        side_norm = _normalize_apex_side(pos.get("side"))
+        entry = _extract_entry_price_from_position(pos)
+        with POSITION_LOCK:
+            POSITION.update({
+                "open": True,
+                "side": side_norm,
+                "size": size,
+                "entry": entry,
+                "order_id": None, "tp_id": None, "sl_id": None,
+                "tp": None, "sl": None,
+                "margin": None, "reserved_margin": None,
+            })
+        dash("state", "Cold-start: detected live position",
+             extra={"side": side_norm, "size": str(size), "entry": str(entry) if entry else None})
+    except Exception as e:
+        dash("warn", f"cold_start_sync_position error: {e}")
+
+# ---------------- Health & admin ----------------
 @app.route("/__alive__", methods=["GET"])
 def alive():
     return jsonify({
@@ -1052,6 +1179,7 @@ def alive():
         "bias": BIAS,
         "use_bias": USE_BIAS,
         "heartbeat_seq": HEARTBEAT_SEQ,
+        "last_heartbeat_ts": LAST_HEARTBEAT_TS,
         "mf_last": STATE["last_mf"],
         "trend_last": STATE["last_trend"],
         "mf_flip_since_entry": STATE["mf_flip_since_entry"],
@@ -1087,109 +1215,26 @@ def admin_reset_state():
     _full_reset("ADMIN")
     return jsonify({"ok": True, "msg": "state reset"}), 200
 
-# ---------------- Background Threads ----------------
-def bg_bias_loop():
-    dash_startup()
-    while STATE["running"]:
-        try:
-            compute_bias()
-        except Exception as e:
-            dash("warn", f"bias loop error: {e}")
-        time.sleep(60)
+@app.route("/admin/reconcile", methods=["POST","GET"])
+def admin_reconcile():
+    reconcile_with_exchange()
+    exch = bool(get_open_position())
+    with POSITION_LOCK:
+        local = {
+            "open": POSITION["open"],
+            "side": POSITION["side"],
+            "size": str(POSITION["size"]) if POSITION["size"] else None,
+            "entry": str(POSITION["entry"]) if POSITION["entry"] else None,
+        }
+    return jsonify({"ok": True, "exchange_open": exch, "local": local}), 200
 
-def bg_monitor_loop():
-    last_open = None
-    while STATE["running"]:
-        try:
-            pos = get_open_position()
-            is_open = bool(pos)
-            if is_open != last_open:
-                last_open = is_open
-                if is_open:
-                    dash("state", "Exchange shows a live position",
-                         extra={"size": pos.get("size"), "side": pos.get("side")})
-                else:
-                    dash("state", "Exchange shows FLAT")
-            time.sleep(5)
-        except Exception as e:
-            dash("warn", f"monitor loop error: {e}")
-            time.sleep(2)
-
-def bg_heartbeat_loop():
-    """Periodic status line so logs never go totally quiet on Render."""
-    global HEARTBEAT_SEQ
-    while STATE["running"]:
-        try:
-            with POSITION_LOCK:
-                pos_snapshot = {
-                    "open": POSITION["open"],
-                    "side": POSITION["side"],
-                    "size": str(POSITION["size"]) if POSITION["size"] else None,
-                    "entry": str(POSITION["entry"]) if POSITION["entry"] else None,
-                    "tp": str(POSITION["tp"]) if POSITION["tp"] else None,
-                    "sl": str(POSITION["sl"]) if POSITION["sl"] else None,
-                }
-            HEARTBEAT_SEQ += 1
-            dash("state", "heartbeat", extra={
-                "hb_seq": HEARTBEAT_SEQ,
-                "bias": BIAS,
-                "mf_last": STATE["last_mf"],
-                "trend_last": STATE["last_trend"],
-                "position": pos_snapshot
-            })
-            time.sleep(max(10, DASH_HEARTBEAT_SEC))
-        except Exception as e:
-            dash("warn", f"heartbeat error: {e}")
-            time.sleep(10)
-
-_THREADS_STARTED = False
-def start_background_threads_once():
-    global _THREADS_STARTED
-    if _THREADS_STARTED:
-        return
-    threading.Thread(target=bg_bias_loop,     name="bias",      daemon=True).start()
-    threading.Thread(target=bg_monitor_loop,  name="monitor",   daemon=True).start()
-    threading.Thread(target=tp_sl_watchdog,   name="tp_sl",     daemon=True).start()
-    threading.Thread(target=bg_heartbeat_loop,name="heartbeat", daemon=True).start()
-    _THREADS_STARTED = True
-
-# ---------------- Cold-start sync ----------------
-def cold_start_sync_position():
-    """On boot, read exchange position and sync local POSITION for accurate logging/state."""
-    try:
-        pos = get_open_position()
-        if not pos:
-            dash("state", "Cold-start: exchange shows FLAT")
-            return
-        size = _D_safe(pos.get("size")) or Decimal("0")
-        if size == 0:
-            dash("state", "Cold-start: exchange position size=0 → FLAT")
-            return
-        side_norm = _normalize_apex_side(pos.get("side"))
-        entry = _extract_entry_price_from_position(pos)
-        with POSITION_LOCK:
-            POSITION.update({
-                "open": True,
-                "side": side_norm,
-                "size": size,
-                "entry": entry,
-                "order_id": None, "tp_id": None, "sl_id": None,
-                "tp": None, "sl": None,
-                "margin": None, "reserved_margin": None,
-            })
-        dash("state", "Cold-start: detected live position",
-             extra={"side": side_norm, "size": str(size), "entry": str(entry) if entry else None})
-    except Exception as e:
-        dash("warn", f"cold_start_sync_position error: {e}")
-
+# ---------------- Boot ----------------
 def boot_on_import():
     # Called at module import (so gunicorn workers start processing immediately)
     dash_startup()
-    # Capital Manager connectivity check (non-fatal)
     dash("state", "Pinging Capital Manager…", extra={"url": CAPMGR_URL})
     ping_capital_manager()
     dash_capital_status_once()
-    # Cold-start position sync BEFORE launching loops
     cold_start_sync_position()
     start_background_threads_once()
 
@@ -1202,7 +1247,6 @@ if __name__ == "__main__":
     app.config.update(ENV="production", DEBUG=False)
     port = int(os.environ.get("PORT", "5008"))
     dash("ok", f"Serving on 0.0.0.0:{port}")
-    # Cold-start sync when run locally too
     cold_start_sync_position()
     start_background_threads_once()
     app.run(
